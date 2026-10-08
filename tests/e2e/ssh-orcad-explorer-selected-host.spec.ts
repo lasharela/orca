@@ -224,6 +224,27 @@ for (const selectedHost of ['A', 'B'] as const) {
       await expect(page.getByText(`NESTED_${otherName}.txt`, { exact: true })).toBeVisible()
       await expect(page.getByText(`NESTED_${selectedHost}.txt`, { exact: true })).toHaveCount(0)
       await page.screenshot({ path: testInfo.outputPath('same-path-host-switch-refreshed.png') })
+      await page.waitForTimeout(1_000)
+      const switchedMarker = `SWITCHED_HOST_${otherName}.txt`
+      const switchedChange = page.waitForEvent('console', {
+        predicate: (message) =>
+          message.text().startsWith('[file-change-event]') &&
+          message.text().includes(switchedMarker) &&
+          message.text().includes(otherEnvironment.id),
+        timeout: 15_000
+      })
+      otherHost.exec?.(`printf 'switched host\\n' > '${folderPath}/${switchedMarker}'`)
+      console.log(
+        '[switched-host-created-file]',
+        await serverCall(page, otherEnvironment.id, 'files.read', {
+          worktree: `id:${worktreeId}`,
+          relativePath: switchedMarker
+        })
+      )
+      await page.screenshot({ path: testInfo.outputPath('switched-host-new-file-observed.png') })
+      await switchedChange
+      await expect(page.getByText(switchedMarker, { exact: true })).toBeVisible({ timeout: 10_000 })
+      await page.screenshot({ path: testInfo.outputPath('switched-host-new-file-visible.png') })
       await page
         .getByRole('option')
         .filter({ hasText: `Folder host ${selectedHost}` })

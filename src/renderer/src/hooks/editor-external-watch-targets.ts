@@ -33,7 +33,7 @@ export type EditorExternalWatchTargetState = Pick<
   | 'folderWorkspaces'
   | 'projectGroups'
 > &
-  Partial<Pick<AppState, 'rightSidebarEffectiveTab'>>
+  Partial<Pick<AppState, 'activeWorkspaceExecutionHostId' | 'rightSidebarEffectiveTab'>>
 
 type WatchedTargetsSnapshot = {
   targets: EditorExternalWatchTarget[]
@@ -44,6 +44,7 @@ let cachedOpenFiles: AppState['openFiles'] | null = null
 let cachedWorktreesByRepo: AppState['worktreesByRepo'] | null = null
 let cachedRepos: AppState['repos'] | null = null
 let cachedActiveWorktreeId: string | null = null
+let cachedActiveWorkspaceExecutionHostId: AppState['activeWorkspaceExecutionHostId'] = null
 let cachedRuntimeEnvironmentId: string | undefined
 let cachedRightSidebarOpen: boolean | null = null
 let cachedRightSidebarTab: AppState['rightSidebarTab'] | null = null
@@ -113,11 +114,13 @@ export function selectEditorExternalWatchTargets(
   state: EditorExternalWatchTargetState
 ): WatchedTargetsSnapshot {
   const runtimeEnvironmentId = state.settings?.activeRuntimeEnvironmentId?.trim() || undefined
+  const activeWorkspaceExecutionHostId = state.activeWorkspaceExecutionHostId ?? null
   if (
     cachedOpenFiles === state.openFiles &&
     cachedWorktreesByRepo === state.worktreesByRepo &&
     cachedRepos === state.repos &&
     cachedActiveWorktreeId === state.activeWorktreeId &&
+    cachedActiveWorkspaceExecutionHostId === activeWorkspaceExecutionHostId &&
     cachedRuntimeEnvironmentId === runtimeEnvironmentId &&
     cachedRightSidebarOpen === state.rightSidebarOpen &&
     cachedRightSidebarTab === state.rightSidebarTab &&
@@ -247,6 +250,7 @@ export function selectEditorExternalWatchTargets(
   cachedWorktreesByRepo = state.worktreesByRepo
   cachedRepos = state.repos
   cachedActiveWorktreeId = state.activeWorktreeId
+  cachedActiveWorkspaceExecutionHostId = activeWorkspaceExecutionHostId
   cachedRuntimeEnvironmentId = runtimeEnvironmentId
   cachedRightSidebarOpen = state.rightSidebarOpen
   cachedRightSidebarTab = state.rightSidebarTab

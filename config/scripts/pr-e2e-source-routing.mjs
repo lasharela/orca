@@ -66,6 +66,7 @@ export const PR_E2E_SOURCE_ROUTES = [
       (file === 'src/renderer/src/components/right-sidebar/useFileExplorerWatch.ts' ||
         file === 'src/renderer/src/components/right-sidebar/file-explorer-operation-owner.ts' ||
         file === 'src/renderer/src/components/right-sidebar/FileExplorer.tsx' ||
+        file === 'src/renderer/src/hooks/editor-external-watch-targets.ts' ||
         file === 'src/renderer/src/components/right-sidebar/useFileExplorerTree.ts' ||
         file === 'src/renderer/src/components/right-sidebar/use-file-explorer-tree-load-effects.ts')
   },

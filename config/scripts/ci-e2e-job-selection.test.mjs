@@ -258,6 +258,7 @@ it.each([
   'src/renderer/src/components/right-sidebar/useFileExplorerWatch.ts',
   'src/renderer/src/components/right-sidebar/file-explorer-operation-owner.ts',
   'src/renderer/src/components/right-sidebar/FileExplorer.tsx',
+  'src/renderer/src/hooks/editor-external-watch-targets.ts',
   'src/renderer/src/components/right-sidebar/useFileExplorerTree.ts',
   'src/renderer/src/components/right-sidebar/use-file-explorer-tree-load-effects.ts'
 ])('routes %s to the template-building selected-host explorer lane', (file) => {
