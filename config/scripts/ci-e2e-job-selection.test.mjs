@@ -239,3 +239,17 @@ it.each([
     spec
   )
 })
+
+it.each([
+  'src/renderer/src/components/right-sidebar/useFileExplorerWatch.ts',
+  'src/renderer/src/hooks/worktree-file-change-event.ts'
+])('routes %s to the template-building explorer watch recovery lane', (file) => {
+  const spec = 'tests/e2e/ssh-orcad-explorer-watch-recovery.spec.ts'
+  expect(selectPrE2eSpecs([file])).toContain(spec)
+  expect(classify([spec])).toEqual({ e2e_run_changed: false, e2e_needs_build: true })
+  const job = workflow.jobs['orcad-auto-convert-docker']
+  expect(job.if).toContain(spec)
+  expect(job.steps.find((step) => step.name === 'Convert a relay-era Docker host').run).toContain(
+    spec
+  )
+})

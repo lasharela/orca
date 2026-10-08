@@ -7,7 +7,7 @@ import type {
 } from './file-explorer-types'
 import type { InlineInput } from './file-explorer-inline-input-row'
 import { useAppStore } from '@/store'
-import { subscribeRuntimeFileChanges } from '@/runtime/runtime-file-client'
+import { ORCA_WORKTREE_FILE_CHANGE_EVENT } from '@/hooks/worktree-file-change-event'
 import { normalizeRuntimePathForComparison } from '../../../../shared/cross-platform-path'
 import {
   getFileExplorerOperationOwner,
@@ -228,45 +228,24 @@ export function useFileExplorerWatch({
       processPayload(payload)
     }
 
+    const handleRuntimeChange = (
+      event: WindowEventMap[typeof ORCA_WORKTREE_FILE_CHANGE_EVENT]
+    ): void => {
+      if (event.detail.runtimeEnvironmentId === activeRuntimeEnvironmentId) {
+        handleFsChanged(event.detail.payload)
+      }
+    }
     let unsubscribeListener: (() => void) | null = null
     if (activeRuntimeEnvironmentId?.trim() && activeWorktreeId) {
-      // Why: remote runtime watch events don't enter the local Electron fs:changed bus, so subscribe directly.
-      void subscribeRuntimeFileChanges(
-        {
-          settings: { activeRuntimeEnvironmentId },
-          worktreeId: activeWorktreeId,
-          worktreePath,
-          connectionId: undefined
-        },
-        handleFsChanged,
-        (err) => {
-          console.warn('[filesystem-watch] failed to subscribe to runtime file changes', {
-            worktreeId: activeWorktreeId,
-            worktreePath,
-            error: err.message
-          })
-        }
-      )
-        .then((unsubscribe) => {
-          if (disposed) {
-            unsubscribe()
-            return
-          }
-          unsubscribeListener = unsubscribe
-        })
-        .catch((err) => {
-          console.warn('[filesystem-watch] failed to subscribe to runtime file changes', {
-            worktreeId: activeWorktreeId,
-            worktreePath,
-            error: err instanceof Error ? err.message : String(err)
-          })
-        })
+      // The app watcher owns recovery; a separate stream would strand this consumer after reconnect.
+      window.addEventListener(ORCA_WORKTREE_FILE_CHANGE_EVENT, handleRuntimeChange)
     } else {
       unsubscribeListener = window.api.fs.onFsChanged(handleFsChanged)
     }
 
     return () => {
       disposed = true
+      window.removeEventListener(ORCA_WORKTREE_FILE_CHANGE_EVENT, handleRuntimeChange)
       unsubscribeListener?.()
       if (activeResyncByWatchKey.get(currentWatchKey) === scheduler.requestFullRefresh) {
         activeResyncByWatchKey.delete(currentWatchKey)
