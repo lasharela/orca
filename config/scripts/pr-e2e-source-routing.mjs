@@ -59,6 +59,14 @@ export const PR_E2E_SOURCE_ROUTES = [
       )
   },
   {
+    id: 'ssh.orcad-explorer-selected-host',
+    specs: ['tests/e2e/ssh-orcad-explorer-selected-host.spec.ts'],
+    matches: (file) =>
+      isProductSource(file) &&
+      (file === 'src/renderer/src/components/right-sidebar/useFileExplorerWatch.ts' ||
+        file === 'src/renderer/src/components/right-sidebar/file-explorer-operation-owner.ts')
+  },
+  {
     id: 'serve.orcad-mode-switch',
     specs: ['tests/e2e/orcad-serve-mode-switch.spec.ts'],
     matches: (file) =>
