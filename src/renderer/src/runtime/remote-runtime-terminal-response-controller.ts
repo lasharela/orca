@@ -13,6 +13,26 @@ import {
 import type { TerminalMultiplexEvent } from './remote-runtime-terminal-multiplexer-types'
 import { unwrapRuntimeRpcResult } from './runtime-rpc-client'
 
+type SubscribedCapabilities = {
+  ackOutputSourceRanges: boolean
+  outputPause: boolean
+  inputAck: boolean
+}
+
+// Why parse: the frame comes off the wire, so a malformed or legacy capabilities value must read as "unsupported".
+function parseSubscribedCapabilities(value: unknown): SubscribedCapabilities {
+  if (typeof value !== 'object' || value === null) {
+    return { ackOutputSourceRanges: false, outputPause: false, inputAck: false }
+  }
+  const record: { ackOutputSourceRanges?: unknown; outputPause?: unknown; inputAck?: unknown } =
+    value
+  return {
+    ackOutputSourceRanges: record.ackOutputSourceRanges === 1,
+    outputPause: record.outputPause === 1,
+    inputAck: record.inputAck === 1
+  }
+}
+
 export abstract class RemoteRuntimeTerminalResponseController extends RemoteRuntimeTerminalFlowController {
   protected handleResponse(response: RuntimeRpcResponse<unknown>): void {
     if (!this.matchesCurrentEnvironmentRevision()) {
@@ -45,23 +65,19 @@ export abstract class RemoteRuntimeTerminalResponseController extends RemoteRunt
       return
     }
     if (event.type === 'subscribed') {
-      const capabilities: unknown = event.capabilities
-      const capability = (name: string): unknown =>
-        typeof capabilities === 'object' && capabilities !== null
-          ? Reflect.get(capabilities, name)
-          : undefined
+      const capabilities = parseSubscribedCapabilities(event.capabilities)
       if (
-        capability('ackOutputSourceRanges') === 1 &&
+        capabilities.ackOutputSourceRanges &&
         typeof event.streamGeneration === 'string' &&
         event.streamGeneration.length > 0
       ) {
         stream.acknowledgeOutputSourceRanges = true
         stream.streamGeneration = event.streamGeneration
       }
-      stream.supportsOutputPause = capability('outputPause') === 1
+      stream.supportsOutputPause = capabilities.outputPause
       // Why require the ledger id: without it a runtime restart could not be told apart, and replay would run input twice.
       stream.inputLedgerId =
-        capability('inputAck') === 1 &&
+        capabilities.inputAck &&
         typeof event.inputLedgerId === 'string' &&
         event.inputLedgerId.length > 0
           ? event.inputLedgerId
