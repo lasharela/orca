@@ -32,7 +32,9 @@ export enum TerminalStreamOpcode {
   // Negotiated per stream; older hosts reject unknown opcodes, so clients send only after capability confirmation.
   SetOutputPaused = 16,
   // Negotiated per stream because older clients reject unknown opcodes.
-  WriteUnavailable = 17
+  WriteUnavailable = 17,
+  // Host->client; `seq` is the client input sequence the host applied. Sent only after `inputAck` negotiation.
+  InputAck = 18
 }
 
 export type TerminalStreamFrame = {
@@ -122,6 +124,7 @@ function isTerminalStreamOpcode(value: number): value is TerminalStreamOpcode {
     value === TerminalStreamOpcode.ClaimViewport ||
     value === TerminalStreamOpcode.OutputSpan ||
     value === TerminalStreamOpcode.SetOutputPaused ||
-    value === TerminalStreamOpcode.WriteUnavailable
+    value === TerminalStreamOpcode.WriteUnavailable ||
+    value === TerminalStreamOpcode.InputAck
   )
 }

@@ -1,0 +1,182 @@
+import './unused-default-rpc-methods.test-fixture'
+import { describe, expect, it, vi } from 'vitest'
+import { RpcDispatcher } from './dispatcher'
+import type { OrcaRuntimeService } from '../orca-runtime'
+import { TERMINAL_METHODS } from './methods/terminal'
+import { createSubscriptionRegistryDouble } from './subscription-registry-test-double'
+import type { RuntimeTerminalWait } from '../../../shared/runtime-types'
+import {
+  TerminalStreamOpcode,
+  decodeTerminalStreamFrame,
+  encodeTerminalStreamFrame,
+  encodeTerminalStreamJson,
+  encodeTerminalStreamText
+} from '../../../shared/terminal-stream-protocol'
+import { makeRequest, stubRuntime } from './terminal-multiplex-test-harness'
+
+type FrameHandler = (frame: NonNullable<ReturnType<typeof decodeTerminalStreamFrame>>) => void
+
+function createRuntime(writes: string[]): OrcaRuntimeService {
+  const registry = createSubscriptionRegistryDouble()
+  return stubRuntime({
+    readTerminal: vi.fn().mockResolvedValue({ tail: [], truncated: false }),
+    serializeTerminalBuffer: vi.fn().mockResolvedValue({ data: 'snapshot', cols: 120, rows: 40 }),
+    getTerminalSize: vi.fn().mockReturnValue({ cols: 120, rows: 40 }),
+    getMobileDisplayMode: vi.fn().mockReturnValue('auto'),
+    getLayout: vi.fn().mockReturnValue({ seq: 1 }),
+    subscribeToTerminalData: vi.fn().mockReturnValue(vi.fn()),
+    subscribeToTerminalResize: vi.fn().mockReturnValue(vi.fn()),
+    subscribeToFitOverrideChanges: vi.fn().mockReturnValue(vi.fn()),
+    subscribeToDriverChanges: vi.fn().mockReturnValue(vi.fn()),
+    getTerminalFitOverride: vi.fn().mockReturnValue(null),
+    getDriver: vi.fn().mockReturnValue({ kind: 'idle' }),
+    registerSubscriptionCleanup: vi.fn(registry.registerSubscriptionCleanup),
+    registerOwnedSubscriptionCleanup: vi.fn(registry.registerOwnedSubscriptionCleanup),
+    cleanupSubscription: vi.fn(registry.cleanupSubscription),
+    cleanupSubscriptionIfOwnedByConnection: vi.fn(registry.cleanupSubscriptionIfOwnedByConnection),
+    cleanupSubscriptionsForConnection: vi.fn(registry.cleanupSubscriptionsForConnection),
+    waitForTerminal: vi.fn(() => new Promise<RuntimeTerminalWait>(() => {})),
+    updateDesktopViewport: vi.fn().mockResolvedValue(true),
+    sendTerminal: vi.fn(async (_handle: string, action: { text?: string }) => {
+      writes.push(action.text ?? '')
+      return { handle: 'terminal-1', accepted: true, bytesWritten: action.text?.length ?? 0 }
+    })
+  })
+}
+
+async function openConnection(
+  dispatcher: RpcDispatcher,
+  connectionId: string,
+  subscribe: { capabilities: Record<string, 1>; inputSessionId?: string }
+) {
+  const messages: string[] = []
+  const binaryFrames: Uint8Array<ArrayBufferLike>[] = []
+  const handlers = new Map<number, FrameHandler>()
+  void dispatcher.dispatchStreaming(
+    makeRequest('terminal.multiplex', {}),
+    (message) => messages.push(message),
+    {
+      connectionId,
+      sendBinary: (bytes) => {
+        binaryFrames.push(bytes)
+      },
+      registerBinaryStreamHandler: (streamId, handler) => {
+        handlers.set(streamId, handler)
+        return () => handlers.delete(streamId)
+      }
+    }
+  )
+  await vi.waitFor(() => expect(handlers.has(0)).toBe(true))
+  handlers.get(0)?.(
+    decodeTerminalStreamFrame(
+      encodeTerminalStreamFrame({
+        opcode: TerminalStreamOpcode.Subscribe,
+        streamId: 0,
+        seq: 1,
+        payload: encodeTerminalStreamJson({
+          streamId: 7,
+          terminal: 'terminal-1',
+          client: { id: 'desktop-1', type: 'desktop' },
+          viewport: { cols: 120, rows: 40 },
+          ...subscribe
+        })
+      })
+    )!
+  )
+  await vi.waitFor(() =>
+    expect(messages.some((message) => JSON.parse(message).result?.type === 'subscribed')).toBe(true)
+  )
+  const subscribed: { capabilities?: Record<string, unknown> } = JSON.parse(
+    messages.find((message) => JSON.parse(message).result?.type === 'subscribed')!
+  ).result
+  return {
+    subscribed,
+    sendInput: (seq: number, text: string) =>
+      handlers.get(7)?.(
+        decodeTerminalStreamFrame(
+          encodeTerminalStreamFrame({
+            opcode: TerminalStreamOpcode.Input,
+            streamId: 7,
+            seq,
+            payload: encodeTerminalStreamText(text)
+          })
+        )!
+      ),
+    inputAcks: () =>
+      binaryFrames
+        .map((bytes) => decodeTerminalStreamFrame(bytes))
+        .filter((frame) => frame?.opcode === TerminalStreamOpcode.InputAck)
+        .map((frame) => frame!.seq)
+  }
+}
+
+describe('terminal multiplex sequenced input across reconnects', () => {
+  it('writes input replayed on a new connection exactly once, even when the dead connection delivers late', async () => {
+    const writes: string[] = []
+    const dispatcher = new RpcDispatcher({
+      runtime: createRuntime(writes),
+      methods: TERMINAL_METHODS
+    })
+    const subscribe = {
+      capabilities: { ackOutput: 1 as const, inputAck: 1 as const },
+      inputSessionId: 'pane-a'
+    }
+    const dead = await openConnection(dispatcher, 'conn-dead', subscribe)
+    expect(dead.subscribed.capabilities).toMatchObject({ inputAck: 1 })
+
+    dead.sendInput(1, 'PZ600-0')
+    await vi.waitFor(() => expect(dead.inputAcks()).toEqual([1]))
+    // The ack for seq 2 never reaches the client: the link went silent.
+    dead.sendInput(2, '12')
+
+    const replacement = await openConnection(dispatcher, 'conn-replacement', subscribe)
+    replacement.sendInput(2, '12')
+    replacement.sendInput(3, '3\r')
+    // The surviving SSH channel finally flushes the dead connection's buffered copy.
+    dead.sendInput(3, '3\r')
+
+    await vi.waitFor(() => expect(replacement.inputAcks()).toEqual([2, 3]))
+    expect(writes).toEqual(['PZ600-0', '12', '3\r'])
+  })
+
+  it('keeps input from separate panes independent', async () => {
+    const writes: string[] = []
+    const dispatcher = new RpcDispatcher({
+      runtime: createRuntime(writes),
+      methods: TERMINAL_METHODS
+    })
+    const left = await openConnection(dispatcher, 'conn-left', {
+      capabilities: { inputAck: 1 },
+      inputSessionId: 'pane-left'
+    })
+    const right = await openConnection(dispatcher, 'conn-right', {
+      capabilities: { inputAck: 1 },
+      inputSessionId: 'pane-right'
+    })
+
+    left.sendInput(1, 'l')
+    right.sendInput(1, 'r')
+
+    await vi.waitFor(() => expect(writes).toEqual(['l', 'r']))
+  })
+
+  it('leaves a client that did not negotiate input acks on the unsequenced path', async () => {
+    const writes: string[] = []
+    const dispatcher = new RpcDispatcher({
+      runtime: createRuntime(writes),
+      methods: TERMINAL_METHODS
+    })
+    // An older client never names an input session; a session id without the capability is ignored too.
+    const legacy = await openConnection(dispatcher, 'conn-legacy', {
+      capabilities: { ackOutput: 1 },
+      inputSessionId: 'pane-legacy'
+    })
+    expect(legacy.subscribed.capabilities?.inputAck).toBeUndefined()
+
+    legacy.sendInput(2, 'x')
+    legacy.sendInput(2, 'x')
+
+    await vi.waitFor(() => expect(writes).toEqual(['x', 'x']))
+    expect(legacy.inputAcks()).toEqual([])
+  })
+})

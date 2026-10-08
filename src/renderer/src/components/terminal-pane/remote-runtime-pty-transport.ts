@@ -4,6 +4,7 @@ import {
   createRemoteRuntimeRecoveryInputHold,
   type RemoteRuntimeInputEndpoint
 } from './remote-runtime-recovery-input-hold'
+import { createRemoteRuntimeInputJournal } from './remote-runtime-input-journal'
 import type { TerminalInputKind } from '../../../../shared/terminal-input-kind'
 /* eslint-disable max-lines -- Why: remote PTY transport keeps lifecycle, JSON fallback, and binary stream wiring together so reconnect/destroy ordering stays testable as one behavior surface. */
 import type { RuntimeRpcResponse } from '../../../../shared/runtime-rpc-envelope'
@@ -299,13 +300,13 @@ export function createRemoteRuntimePtyTransport(
   }
 
   const recoveryInputHold = createRemoteRuntimeRecoveryInputHold()
+  const inputJournal = createRemoteRuntimeInputJournal()
+  // Why: replay owed input exactly once per stream, before anything new is sequenced on it.
+  let inputJournalReplayedStream: RemoteRuntimeMultiplexedTerminal | null = null
   const recovery = new RemoteRuntimePtyRecoveryState(() => {
     if (recovery.currentPhase === 'disposed') {
       clearPublishedHandleWait()
-    }
-    if (recovery.currentPhase === 'disconnected' || recovery.currentPhase === 'disposed') {
-      // Why: once auto-recovery gives up, held keys would land at an arbitrary later reconnect.
-      recoveryInputHold.discard()
+      discardPendingInput()
     }
     if (recovery.currentPhase === 'disconnected') {
       // Why: only the wall-clock deadline is evidence the window was spent; a UI latch from a fatal
@@ -447,8 +448,19 @@ export function createRemoteRuntimePtyTransport(
     pendingViewportClaim = false
     pendingClaimInput = []
     pendingClaimQueryReplyCount = 0
+    const boundHandle = multiplexedStreamHandle
+    if (stream.acknowledgesInput() && boundHandle) {
+      replayUnacknowledgedInput(stream, boundHandle)
+    }
     for (const segment of queued) {
-      stream.sendInput(segment.text)
+      if (stream.acknowledgesInput() && boundHandle) {
+        stream.sendInput(
+          segment.text,
+          inputJournal.record(heldInputEndpoint(boundHandle), segment.text, segment.queryReply)
+        )
+      } else {
+        stream.sendInput(segment.text)
+      }
     }
     for (const resolve of viewportClaimReadyWaiters) {
       resolve(true)
@@ -1456,14 +1468,62 @@ export function createRemoteRuntimePtyTransport(
   }
 
   // Why: a pane binding or auto-recovering a known handle holds typing for it instead of dropping it (#25784).
+  // Why 'disconnected' too: the same handle still reattaches on its own after the window, and the hold only releases to that endpoint.
   function shouldHoldInput(): boolean {
     return (
       !destroyed &&
       !terminalEnded &&
       handle !== null &&
-      recovery.currentPhase !== 'disconnected' &&
-      (recovery.isActive || (connecting && !connected) || recoveryInputHold.isHolding())
+      (recovery.isActive ||
+        recovery.currentPhase === 'disconnected' ||
+        (connecting && !connected) ||
+        recoveryInputHold.isHolding())
     )
+  }
+
+  function discardPendingInput(): void {
+    recoveryInputHold.discard()
+    inputJournal.discard()
+  }
+
+  // Why: these bytes never reached a stream, so holding them for the reattach cannot duplicate them.
+  function holdUnsentInput(text: string): void {
+    if (handle && shouldHoldInput()) {
+      recoveryInputHold.enqueue(heldInputEndpoint(handle), text, 'driving')
+    }
+  }
+
+  function holdUnsentPendingInput(): void {
+    for (const segment of pendingClaimInput) {
+      if (!segment.queryReply) {
+        holdUnsentInput(segment.text)
+      }
+    }
+    pendingClaimInput = []
+    pendingClaimQueryReplyCount = 0
+    inputBatcher.flush()
+  }
+
+  // Why: a host that acks input dedupes by sequence, so resending what it may already have is safe.
+  function replayUnacknowledgedInput(
+    stream: RemoteRuntimeMultiplexedTerminal,
+    boundHandle: string
+  ): void {
+    if (inputJournalReplayedStream === stream) {
+      return
+    }
+    inputJournalReplayedStream = stream
+    if (!stream.acknowledgesInput()) {
+      // Why: without acks, delivery of earlier bytes is unknown; replaying could run them twice.
+      inputJournal.discard()
+      return
+    }
+    for (const entry of inputJournal.unacknowledgedFor(heldInputEndpoint(boundHandle))) {
+      // Why: a query reply answers a query from before the outage; replaying it types garbage.
+      if (!entry.queryReply) {
+        stream.sendInput(entry.text, entry.seq)
+      }
+    }
   }
 
   function heldInputEndpoint(targetHandle: string) {
@@ -1488,17 +1548,15 @@ export function createRemoteRuntimePtyTransport(
   function releaseHeldInput(): void {
     const boundHandle = handle
     if (destroyed || terminalEnded || !boundHandle) {
-      recoveryInputHold.discard()
+      discardPendingInput()
       return
     }
-    if (
-      !connected ||
-      recoveryBlocksIo() ||
-      !attachmentReady ||
-      !getCurrentMultiplexedStream(boundHandle)
-    ) {
+    const stream = getCurrentMultiplexedStream(boundHandle)
+    if (!connected || recoveryBlocksIo() || !attachmentReady || !stream) {
       return
     }
+    // Why first: journaled bytes were typed before anything in the hold.
+    replayUnacknowledgedInput(stream, boundHandle)
     recoveryInputHold.release(heldInputEndpoint(boundHandle), {
       isCurrent: () => connected && handle === boundHandle && !recoveryBlocksIo(),
       sendInput: (data) => sendInputNow(data),
@@ -1576,6 +1634,13 @@ export function createRemoteRuntimePtyTransport(
       return false
     }
     const stream = getCurrentMultiplexedStream(targetHandle)
+    if (stream?.acknowledgesInput()) {
+      replayUnacknowledgedInput(stream, targetHandle)
+      const seq = inputJournal.record(heldInputEndpoint(targetHandle), text, queryReply)
+      // Why true even if unsent: a failed write closes this stream, and the reattach replays the journal.
+      stream.sendInput(text, seq)
+      return true
+    }
     if (stream?.sendInput(text)) {
       return true
     }
@@ -1613,10 +1678,11 @@ export function createRemoteRuntimePtyTransport(
     return true
   }
 
-  const inputBatcher = createRemoteRuntimePtyTextBatcher(
-    REMOTE_TERMINAL_INPUT_FLUSH_MS,
-    sendUnacknowledgedInput
-  )
+  const inputBatcher = createRemoteRuntimePtyTextBatcher(REMOTE_TERMINAL_INPUT_FLUSH_MS, (text) => {
+    if (!sendUnacknowledgedInput(text)) {
+      holdUnsentInput(text)
+    }
+  })
 
   function sendViewportUpdate(cols: number, rows: number, claim = false): void {
     const targetHandle = handle
@@ -1680,7 +1746,7 @@ export function createRemoteRuntimePtyTransport(
   }
 
   function retireRemoteTerminalId(exitCode?: number): void {
-    recoveryInputHold.discard()
+    discardPendingInput()
     recovery.cancel()
     resetRecoveryReplacementPolicy()
     resetSameHandleEndReuse()
@@ -1711,7 +1777,7 @@ export function createRemoteRuntimePtyTransport(
   ): void {
     clearPublishedHandleWait()
     // Why: keys typed at the replaced shell must not run in its successor (#10065).
-    recoveryInputHold.discard()
+    discardPendingInput()
     const replacedPtyId = remotePtyId
     unregisterShutdownHandlers(replacedPtyId)
     handle = nextHandle
@@ -1845,7 +1911,7 @@ export function createRemoteRuntimePtyTransport(
       return
     }
     connecting = false
-    recoveryInputHold.discard()
+    discardPendingInput()
     emitRecoveryState()
     surfaceErrorMessage(message)
   }
@@ -1991,8 +2057,8 @@ export function createRemoteRuntimePtyTransport(
       return
     }
     if (!recoveryWasActive) {
-      // Why: bytes queued before a partition have unknown delivery; never replay them on a replacement stream.
-      inputBatcher.clear()
+      // Why: queued bytes never reached the dead stream, so they are known undelivered; hold them, never drop them.
+      holdUnsentPendingInput()
       viewportBatcher.clear()
       clearPendingViewportClaim()
     }
@@ -2077,7 +2143,7 @@ export function createRemoteRuntimePtyTransport(
     const recoveryWasActive = recovery.isActive
     const recoveryEpoch = recovery.begin()
     if (!recoveryWasActive) {
-      inputBatcher.clear()
+      holdUnsentPendingInput()
       viewportBatcher.clear()
       clearPendingViewportClaim()
     }
@@ -2117,6 +2183,7 @@ export function createRemoteRuntimePtyTransport(
       terminal: subscribedHandle,
       client: { id: clientId, type: 'desktop' },
       viewport: subscribedViewport ?? undefined,
+      inputSessionId: inputJournal.sessionId,
       callbacks: {
         onData: (data, meta) => {
           if (isCurrentSubscription()) {
@@ -2216,7 +2283,7 @@ export function createRemoteRuntimePtyTransport(
             return
           }
           unregisterShutdownHandlers(subscribedPtyId)
-          recoveryInputHold.discard()
+          discardPendingInput()
           connected = false
           connecting = false
           handle = null
@@ -2253,6 +2320,11 @@ export function createRemoteRuntimePtyTransport(
             notifyWriteUnavailable()
           }
         },
+        onInputAcknowledged: (inputSeq) => {
+          if (handle === subscribedHandle) {
+            inputJournal.acknowledge(inputSeq)
+          }
+        },
         onTransportClose: ({ recoverable, retryWithBackoff }) => {
           transportClosed = true
           if (generation !== subscriptionGeneration) {
@@ -2276,7 +2348,7 @@ export function createRemoteRuntimePtyTransport(
             }
           } else {
             connecting = false
-            recoveryInputHold.discard()
+            discardPendingInput()
             recovery.cancel()
             setAttachmentUnavailable()
             emitRecoveryState()
@@ -2342,7 +2414,7 @@ export function createRemoteRuntimePtyTransport(
     if (previousHandle && previousHandle !== nextHandle) {
       // Why: debounced input is scoped by the current terminal handle at flush time.
       inputBatcher.clear()
-      recoveryInputHold.discard()
+      discardPendingInput()
     }
     const persistedEnvironmentId = getRemoteRuntimePtyEnvironmentId(options.existingPtyId)
     handle = nextHandle
@@ -2726,7 +2798,7 @@ export function createRemoteRuntimePtyTransport(
     disconnect() {
       lifecycleEpoch += 1
       attachGeneration += 1
-      recoveryInputHold.discard()
+      discardPendingInput()
       cancelTerminalCreateRetryWait()
       recovery.cancel()
       resetRecoveryReplacementPolicy()
@@ -2764,7 +2836,7 @@ export function createRemoteRuntimePtyTransport(
       outputProcessor.disposePendingSideEffectGauge()
       lifecycleEpoch += 1
       attachGeneration += 1
-      recoveryInputHold.discard()
+      discardPendingInput()
       cancelTerminalCreateRetryWait()
       recovery.cancel()
       resetRecoveryReplacementPolicy()

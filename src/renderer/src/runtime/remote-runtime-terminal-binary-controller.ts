@@ -46,6 +46,12 @@ export abstract class RemoteRuntimeTerminalBinaryController extends RemoteRuntim
       stream.callbacks.onWriteUnavailable?.()
       return
     }
+    if (frame.opcode === TerminalStreamOpcode.InputAck) {
+      if (stream.supportsInputAck) {
+        stream.callbacks.onInputAcknowledged?.(frame.seq)
+      }
+      return
+    }
     if (isOutput) {
       this.handleOutputFrame(frame, stream)
       return

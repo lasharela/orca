@@ -235,6 +235,7 @@ describe('createRemoteRuntimePtyTransport', () => {
     const newStream = {
       streamId: 2,
       sendInput: vi.fn(() => true),
+      acknowledgesInput: vi.fn(() => false),
       resize: vi.fn(() => true),
       serializeBuffer: vi.fn(async () => null),
       close: vi.fn()

@@ -45,8 +45,14 @@ export type PtyPreconnectInputBuffer = {
   clear: () => void
 }
 
+export type PtyPreconnectInputBufferOptions = {
+  // Why: an outage can hold minutes of per-keystroke input; merging keeps the entry cap from dropping keys.
+  coalesceOrdinary?: boolean
+}
+
 export function createPtyPreconnectInputBuffer(
-  initialEntries: readonly PtyPreconnectInputEntry[] = []
+  initialEntries: readonly PtyPreconnectInputEntry[] = [],
+  options: PtyPreconnectInputBufferOptions = {}
 ): PtyPreconnectInputBuffer {
   let pending: BufferedInput[] = []
   let pendingCodeUnits = 0
@@ -61,6 +67,19 @@ export function createPtyPreconnectInputBuffer(
   const retain = (input: BufferedInput): boolean => {
     const activeEntries = activeAcceptedInput ? 1 : 0
     const activeCodeUnits = activeAcceptedInput?.data.length ?? 0
+    const tail = pending.at(-1)
+    if (
+      options.coalesceOrdinary &&
+      buffering &&
+      input.kind === 'ordinary' &&
+      tail?.kind === 'ordinary' &&
+      tail.inputKind === input.inputKind &&
+      input.data.length <= PTY_PRECONNECT_INPUT_MAX_CODE_UNITS - pendingCodeUnits - activeCodeUnits
+    ) {
+      tail.data += input.data
+      pendingCodeUnits += input.data.length
+      return true
+    }
     if (
       !buffering ||
       pending.length + activeEntries >= PTY_PRECONNECT_INPUT_MAX_ENTRIES ||

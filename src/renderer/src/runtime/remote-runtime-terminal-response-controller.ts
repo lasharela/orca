@@ -45,19 +45,21 @@ export abstract class RemoteRuntimeTerminalResponseController extends RemoteRunt
       return
     }
     if (event.type === 'subscribed') {
-      const capabilities =
-        typeof event.capabilities === 'object' && event.capabilities !== null
-          ? (event.capabilities as { ackOutputSourceRanges?: unknown; outputPause?: unknown })
-          : null
+      const capabilities: unknown = event.capabilities
+      const capability = (name: string): unknown =>
+        typeof capabilities === 'object' && capabilities !== null
+          ? Reflect.get(capabilities, name)
+          : undefined
       if (
-        capabilities?.ackOutputSourceRanges === 1 &&
+        capability('ackOutputSourceRanges') === 1 &&
         typeof event.streamGeneration === 'string' &&
         event.streamGeneration.length > 0
       ) {
         stream.acknowledgeOutputSourceRanges = true
         stream.streamGeneration = event.streamGeneration
       }
-      stream.supportsOutputPause = capabilities?.outputPause === 1
+      stream.supportsOutputPause = capability('outputPause') === 1
+      stream.supportsInputAck = capability('inputAck') === 1
       if (stream.supportsOutputPause) {
         stream.callbacks.onOutputPauseCapability?.()
       }

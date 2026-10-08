@@ -34,7 +34,7 @@ export type RemoteRuntimeRecoveryInputHold = {
   discard: () => void
 }
 
-function isSameEndpoint(
+export function isSameRemoteRuntimeInputEndpoint(
   held: RemoteRuntimeInputEndpoint,
   bound: RemoteRuntimeInputEndpoint
 ): boolean {
@@ -61,13 +61,13 @@ export function createRemoteRuntimeRecoveryInputHold(): RemoteRuntimeRecoveryInp
   }
 
   const bufferFor = (endpoint: RemoteRuntimeInputEndpoint): PtyPreconnectInputBuffer => {
-    if (held && !isSameEndpoint(held.endpoint, endpoint)) {
+    if (held && !isSameRemoteRuntimeInputEndpoint(held.endpoint, endpoint)) {
       // Why: input typed at one shell must never run in its replacement (#10065).
       discard()
     }
     if (!held?.buffer.isBuffering()) {
       // Why: a drained buffer refuses input; its release bookkeeping may still be settling.
-      held = { endpoint, buffer: createPtyPreconnectInputBuffer() }
+      held = { endpoint, buffer: createPtyPreconnectInputBuffer([], { coalesceOrdinary: true }) }
     }
     return held.buffer
   }
@@ -83,7 +83,7 @@ export function createRemoteRuntimeRecoveryInputHold(): RemoteRuntimeRecoveryInp
       if (!current) {
         return
       }
-      if (!isSameEndpoint(current.endpoint, bound)) {
+      if (!isSameRemoteRuntimeInputEndpoint(current.endpoint, bound)) {
         discard()
         return
       }

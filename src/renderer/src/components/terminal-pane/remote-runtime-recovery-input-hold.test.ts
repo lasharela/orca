@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { createRemoteRuntimeRecoveryInputHold } from './remote-runtime-recovery-input-hold'
+import { PTY_PRECONNECT_INPUT_MAX_ENTRIES } from './pty-preconnect-input-buffer'
 
 function createWriter() {
   const sent: string[] = []
@@ -23,6 +24,23 @@ function createWriter() {
 const endpoint = { handle: 'terminal-1', incarnationId: 'inc-1' }
 
 describe('remote runtime recovery input hold', () => {
+  it('holds more keystrokes than the per-entry cap during a long outage', async () => {
+    const hold = createRemoteRuntimeRecoveryInputHold()
+    const { sent, writer } = createWriter()
+    // Typing one token a second through a minutes-long outage queues one entry per keystroke.
+    const keys = Array.from({ length: PTY_PRECONNECT_INPUT_MAX_ENTRIES * 2 }, (_, index) =>
+      String(index % 10)
+    )
+    for (const key of keys) {
+      expect(hold.enqueue(endpoint, key, 'driving')).toBe(true)
+    }
+
+    hold.release(endpoint, writer)
+    await vi.waitFor(() => expect(hold.isHolding()).toBe(false))
+
+    expect(sent.join('')).toBe(keys.join(''))
+  })
+
   it('delivers held input in order to the terminal it was typed into', async () => {
     const hold = createRemoteRuntimeRecoveryInputHold()
     const { sent, writer } = createWriter()

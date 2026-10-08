@@ -3439,7 +3439,7 @@
           "TerminalRemoteRuntimeReconnectBanner": {
             "retryingTitle": "Reconnexion au runtime distant",
             "disconnectedTitle": "Runtime distant déconnecté",
-            "retryingBody": "Orca réessaiera pendant une minute au maximum. Ce terminal reprendra si la connexion revient.",
+            "retryingBody": "Orca réessaie automatiquement. Ce terminal reprendra si la connexion revient.",
             "disconnectedBody": "Les tentatives automatiques sont interrompues. Reconnectez-vous pour reprendre cette session de terminal.",
             "reconnectButton": "Reconnecter"
           },

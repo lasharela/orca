@@ -71,6 +71,8 @@ export type TerminalMultiplexStream = {
   ackWindowBytes: number
   supportsOutputPause: boolean
   supportsWriteUnavailable: boolean
+  // Set only when the client negotiated `inputAck`; sequenced Input frames are then deduped and acked.
+  inputSessionId: string | null
   outputPaused: boolean
   supportsDesktopViewportClaims: boolean
   desktopClaimTail: Promise<boolean>
