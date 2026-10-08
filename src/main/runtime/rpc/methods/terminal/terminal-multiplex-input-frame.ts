@@ -38,7 +38,12 @@ export function handleMultiplexInputFrame(
     return
   }
   const inputSeq = frame.seq
-  const admitted = inputSequenceLedger.admit(stream.ptyId, stream.inputSessionId, inputSeq, deliver)
+  const { settled } = inputSequenceLedger.admit(
+    stream.ptyId,
+    stream.inputSessionId,
+    inputSeq,
+    deliver
+  )
   // Why ack a duplicate too: the client replays until acked, and the first copy's ack may have died with its connection.
-  void (admitted ?? Promise.resolve()).then(() => state.sendInputAck(stream, inputSeq))
+  void settled.then(() => state.sendInputAck(stream, inputSeq))
 }

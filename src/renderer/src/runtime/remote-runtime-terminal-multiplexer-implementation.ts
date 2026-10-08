@@ -37,6 +37,7 @@ export class RemoteRuntimeTerminalMultiplexer extends RemoteRuntimeTerminalBinar
       acknowledgeOutputSourceRanges: false,
       supportsOutputPause: false,
       supportsInputAck: false,
+      inputLedgerId: null,
       outputPaused: false,
       streamGeneration: null,
       sourceAckedEndByte: 0,
@@ -89,6 +90,7 @@ export class RemoteRuntimeTerminalMultiplexer extends RemoteRuntimeTerminalBinar
       sendInput: (text, inputSeq) =>
         this.isRegisteredStream(state) && this.sendInput(state, text, inputSeq),
       acknowledgesInput: () => this.isRegisteredStream(state) && state.supportsInputAck,
+      inputLedgerId: () => (this.isRegisteredStream(state) ? state.inputLedgerId : null),
       resize: (cols, rows) =>
         this.isRegisteredStream(state) &&
         this.sendFrame(

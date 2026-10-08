@@ -59,7 +59,14 @@ export abstract class RemoteRuntimeTerminalResponseController extends RemoteRunt
         stream.streamGeneration = event.streamGeneration
       }
       stream.supportsOutputPause = capability('outputPause') === 1
-      stream.supportsInputAck = capability('inputAck') === 1
+      // Why require the ledger id: without it a runtime restart could not be told apart, and replay would run input twice.
+      stream.inputLedgerId =
+        capability('inputAck') === 1 &&
+        typeof event.inputLedgerId === 'string' &&
+        event.inputLedgerId.length > 0
+          ? event.inputLedgerId
+          : null
+      stream.supportsInputAck = stream.inputLedgerId !== null
       if (stream.supportsOutputPause) {
         stream.callbacks.onOutputPauseCapability?.()
       }

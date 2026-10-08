@@ -56,10 +56,19 @@ function sentText(): string {
 }
 
 /** Real hosts publish `subscribed` before the snapshot that completes the attach. */
-function attachStream(streamId: number, capabilities: Record<string, 1>): void {
+function attachStream(
+  streamId: number,
+  capabilities: Record<string, 1>,
+  inputLedgerId = 'ledger-1'
+): void {
   subscriptionCallbacks?.onResponse({
     ok: true,
-    result: { type: 'subscribed', streamId, capabilities }
+    result: {
+      type: 'subscribed',
+      streamId,
+      capabilities,
+      ...(capabilities.inputAck ? { inputLedgerId } : {})
+    }
   })
   emitSnapshot(streamId, 'prompt$ ')
 }
@@ -90,9 +99,13 @@ async function connectPane(capabilities: Record<string, 1>) {
   return { transport, streamId }
 }
 
-async function reconnect(capabilities: Record<string, 1>, attempt: number): Promise<void> {
+async function reconnect(
+  capabilities: Record<string, 1>,
+  attempt: number,
+  inputLedgerId?: string
+): Promise<void> {
   await vi.waitFor(() => expect(subscribeFrameCount()).toBe(attempt))
-  attachStream(latestSubscribePayload().streamId, capabilities)
+  attachStream(latestSubscribePayload().streamId, capabilities, inputLedgerId)
 }
 
 describe('remote pane input across a silent outage', () => {
@@ -129,6 +142,64 @@ describe('remote pane input across a silent outage', () => {
         { seq: lostSeq + 1, text: 'echo 3\r' }
       ])
     )
+    transport.destroy?.()
+  })
+
+  it('drops unacknowledged input instead of replaying it into a restarted host runtime', async () => {
+    const { transport } = await connectPane({ inputAck: 1 })
+    // Applied by the old runtime, but its ack died with the link.
+    transport.sendInput('make deploy\r', 'driving')
+    await vi.waitFor(() => expect(sentInputs()).toHaveLength(1))
+
+    subscriptionCallbacks?.onClose?.()
+    await vi.waitFor(() => expect(runtimeSubscribe).toHaveBeenCalledTimes(2))
+    // Same handle and PTY, but the runtime restarted, so its dedupe ledger is new.
+    await reconnect({ inputAck: 1 }, 2, 'ledger-after-restart')
+    transport.sendInput('ls\r', 'driving')
+
+    await vi.waitFor(() => expect(sentInputs(2).map((input) => input.text)).toEqual(['ls\r']))
+    transport.destroy?.()
+  })
+
+  it('keeps Ctrl+C in sequence with typing across a silent outage', async () => {
+    const { transport } = await connectPane({ inputAck: 1 })
+    transport.sendInput('echo canceled', 'driving')
+    const interrupted = transport.sendInputAccepted?.('\x03', 'driving')
+    await vi.waitFor(() => expect(sentText()).toBe('echo canceled\x03'))
+    transport.sendInput('echo next\r', 'driving')
+    await vi.waitFor(() => expect(sentText()).toBe('echo canceled\x03echo next\r'))
+
+    subscriptionCallbacks?.onClose?.()
+    await vi.waitFor(() => expect(runtimeSubscribe).toHaveBeenCalledTimes(2))
+    await reconnect({ inputAck: 1 }, 2)
+
+    await vi.waitFor(() =>
+      expect(
+        sentInputs(2)
+          .map((input) => input.text)
+          .join('')
+      ).toBe('echo canceled\x03echo next\r')
+    )
+    emitInputAck(latestSubscribePayload().streamId, sentInputs(2).at(-1)?.seq ?? 0)
+    await expect(interrupted).resolves.toBe(true)
+    transport.destroy?.()
+  })
+
+  it('keeps a paste still in size validation ahead of keys typed after the outage', async () => {
+    const { transport } = await connectPane({ inputAck: 1 })
+    const paste = 'A'.repeat(300 * 1024)
+    transport.sendInput(paste, 'driving')
+    subscriptionCallbacks?.onError?.({
+      code: 'remote_runtime_unavailable',
+      message: 'Could not connect to the remote Orca runtime.'
+    })
+    transport.sendInput('B\r', 'driving')
+
+    await vi.waitFor(() => expect(runtimeSubscribe).toHaveBeenCalledTimes(2))
+    await reconnect({ inputAck: 1 }, 2)
+
+    // Why the long timeout: 300 KiB byte-length validation yields and is slow on a loaded runner.
+    await vi.waitFor(() => expect(sentText()).toBe(`${paste}B\r`), { timeout: 10_000 })
     transport.destroy?.()
   })
 

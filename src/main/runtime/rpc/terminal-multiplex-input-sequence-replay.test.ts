@@ -16,7 +16,10 @@ import { makeRequest, stubRuntime } from './terminal-multiplex-test-harness'
 
 type FrameHandler = (frame: NonNullable<ReturnType<typeof decodeTerminalStreamFrame>>) => void
 
-function createRuntime(writes: string[]): OrcaRuntimeService {
+function createRuntime(
+  writes: string[],
+  writeGate: () => Promise<void> = async () => {}
+): OrcaRuntimeService {
   const registry = createSubscriptionRegistryDouble()
   return stubRuntime({
     readTerminal: vi.fn().mockResolvedValue({ tail: [], truncated: false }),
@@ -38,6 +41,7 @@ function createRuntime(writes: string[]): OrcaRuntimeService {
     waitForTerminal: vi.fn(() => new Promise<RuntimeTerminalWait>(() => {})),
     updateDesktopViewport: vi.fn().mockResolvedValue(true),
     sendTerminal: vi.fn(async (_handle: string, action: { text?: string }) => {
+      await writeGate()
       writes.push(action.text ?? '')
       return { handle: 'terminal-1', accepted: true, bytesWritten: action.text?.length ?? 0 }
     })
@@ -86,7 +90,7 @@ async function openConnection(
   await vi.waitFor(() =>
     expect(messages.some((message) => JSON.parse(message).result?.type === 'subscribed')).toBe(true)
   )
-  const subscribed: { capabilities?: Record<string, unknown> } = JSON.parse(
+  const subscribed: { capabilities?: Record<string, unknown>; inputLedgerId?: string } = JSON.parse(
     messages.find((message) => JSON.parse(message).result?.type === 'subscribed')!
   ).result
   return {
@@ -137,6 +141,53 @@ describe('terminal multiplex sequenced input across reconnects', () => {
 
     await vi.waitFor(() => expect(replacement.inputAcks()).toEqual([2, 3]))
     expect(writes).toEqual(['PZ600-0', '12', '3\r'])
+  })
+
+  it('names its input ledger so a restarted runtime is never mistaken for the one that applied input', async () => {
+    const subscribe = { capabilities: { inputAck: 1 as const }, inputSessionId: 'pane-a' }
+    const before = await openConnection(
+      new RpcDispatcher({ runtime: createRuntime([]), methods: TERMINAL_METHODS }),
+      'conn-before',
+      subscribe
+    )
+    // The PTY survives in the daemon; only the runtime (and its in-memory ledger) is new.
+    const after = await openConnection(
+      new RpcDispatcher({ runtime: createRuntime([]), methods: TERMINAL_METHODS }),
+      'conn-after',
+      subscribe
+    )
+    expect(before.subscribed.inputLedgerId).toEqual(expect.any(String))
+    expect(after.subscribed.inputLedgerId).toEqual(expect.any(String))
+    expect(after.subscribed.inputLedgerId).not.toBe(before.subscribed.inputLedgerId)
+  })
+
+  it('acks a replayed duplicate only after the original write lands', async () => {
+    const writes: string[] = []
+    let releaseWrite = (): void => {}
+    let gated = true
+    const dispatcher = new RpcDispatcher({
+      runtime: createRuntime(writes, () =>
+        gated
+          ? new Promise<void>((resolve) => {
+              releaseWrite = resolve
+            })
+          : Promise.resolve()
+      ),
+      methods: TERMINAL_METHODS
+    })
+    const subscribe = { capabilities: { inputAck: 1 as const }, inputSessionId: 'pane-a' }
+    const dead = await openConnection(dispatcher, 'conn-dead', subscribe)
+    dead.sendInput(1, 'make deploy\r')
+    const replacement = await openConnection(dispatcher, 'conn-replacement', subscribe)
+    replacement.sendInput(1, 'make deploy\r')
+
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    expect(writes).toEqual([])
+    expect(replacement.inputAcks()).toEqual([])
+    gated = false
+    releaseWrite()
+    await vi.waitFor(() => expect(replacement.inputAcks()).toEqual([1]))
+    expect(writes).toEqual(['make deploy\r'])
   })
 
   it('keeps input from separate panes independent', async () => {

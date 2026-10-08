@@ -456,7 +456,12 @@ export function createRemoteRuntimePtyTransport(
       if (stream.acknowledgesInput() && boundHandle) {
         stream.sendInput(
           segment.text,
-          inputJournal.record(heldInputEndpoint(boundHandle), segment.text, segment.queryReply)
+          inputJournal.record(
+            heldInputEndpoint(boundHandle),
+            stream.inputLedgerId(),
+            segment.text,
+            segment.queryReply
+          )
         )
       } else {
         stream.sendInput(segment.text)
@@ -1504,6 +1509,32 @@ export function createRemoteRuntimePtyTransport(
     inputBatcher.flush()
   }
 
+  // Why: reserves this key's slot behind input still in size validation, which reaches the hold first.
+  function holdAcceptedAfterValidation(
+    data: string,
+    inputKind: TerminalInputKind
+  ): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
+      let ran = false
+      inputBatcher.enqueueAfterValidation(() => {
+        ran = true
+        inputBatcher.flush()
+        const held = handle && shouldHoldInput() ? heldInputEndpoint(handle) : null
+        resolve(
+          held
+            ? recoveryInputHold.enqueueAccepted(held, data, inputKind)
+            : sendInputAcceptedToRuntime(data)
+        )
+      })
+      // Why: a cleared batcher skips the reserved slot; settle instead of hanging the caller.
+      void inputBatcher.drain().then(() => {
+        if (!ran) {
+          resolve(false)
+        }
+      })
+    })
+  }
+
   // Why: a host that acks input dedupes by sequence, so resending what it may already have is safe.
   function replayUnacknowledgedInput(
     stream: RemoteRuntimeMultiplexedTerminal,
@@ -1518,7 +1549,10 @@ export function createRemoteRuntimePtyTransport(
       inputJournal.discard()
       return
     }
-    for (const entry of inputJournal.unacknowledgedFor(heldInputEndpoint(boundHandle))) {
+    for (const entry of inputJournal.unacknowledgedFor(
+      heldInputEndpoint(boundHandle),
+      stream.inputLedgerId()
+    )) {
       // Why: a query reply answers a query from before the outage; replaying it types garbage.
       if (!entry.queryReply) {
         stream.sendInput(entry.text, entry.seq)
@@ -1595,6 +1629,10 @@ export function createRemoteRuntimePtyTransport(
     } catch {
       return false
     }
+    const stream = getCurrentMultiplexedStream(targetHandle)
+    if (stream?.acknowledgesInput()) {
+      return sendSequencedInputAccepted(stream, targetHandle, text)
+    }
     try {
       for (const chunk of iterateTerminalInputChunks(text)) {
         if (!connected || handle !== targetHandle || recoveryBlocksIo()) {
@@ -1621,6 +1659,27 @@ export function createRemoteRuntimePtyTransport(
     }
   }
 
+  // Why: accepted keys (Ctrl+C, Escape, paste) share the typing sequence, so an outage replays them in place.
+  function sendSequencedInputAccepted(
+    stream: RemoteRuntimeMultiplexedTerminal,
+    targetHandle: string,
+    text: string
+  ): Promise<boolean> {
+    replayUnacknowledgedInput(stream, targetHandle)
+    const acknowledged: Promise<boolean>[] = []
+    for (const chunk of iterateTerminalInputChunks(text)) {
+      const seq = inputJournal.record(
+        heldInputEndpoint(targetHandle),
+        stream.inputLedgerId(),
+        chunk
+      )
+      acknowledged.push(inputJournal.whenAcknowledged(seq))
+      // Why ignore a failed send: it closes this stream, and the reattach replays the journal.
+      stream.sendInput(chunk, seq)
+    }
+    return Promise.all(acknowledged).then((results) => results.every(Boolean))
+  }
+
   function notifyWriteUnavailable(): void {
     if (!destroyed) {
       storedCallbacks.onWriteUnavailable?.()
@@ -1636,7 +1695,12 @@ export function createRemoteRuntimePtyTransport(
     const stream = getCurrentMultiplexedStream(targetHandle)
     if (stream?.acknowledgesInput()) {
       replayUnacknowledgedInput(stream, targetHandle)
-      const seq = inputJournal.record(heldInputEndpoint(targetHandle), text, queryReply)
+      const seq = inputJournal.record(
+        heldInputEndpoint(targetHandle),
+        stream.inputLedgerId(),
+        text,
+        queryReply
+      )
       // Why true even if unsent: a failed write closes this stream, and the reattach replays the journal.
       stream.sendInput(text, seq)
       return true
@@ -2860,7 +2924,15 @@ export function createRemoteRuntimePtyTransport(
     sendInput(data, inputKind): boolean {
       const held = releaseThenHoldEndpoint(inputKind)
       if (held) {
-        return !data || recoveryInputHold.enqueue(held, data, inputKind)
+        if (!data) {
+          return true
+        }
+        // Why: earlier input still in size validation reaches the hold later; queue behind it.
+        if (inputBatcher.hasPendingValidation()) {
+          return inputBatcher.push(data)
+        }
+        inputBatcher.flush()
+        return recoveryInputHold.enqueue(held, data, inputKind)
       }
       return sendInputNow(data)
     },
@@ -2871,6 +2943,10 @@ export function createRemoteRuntimePtyTransport(
     sendInputAccepted(data, inputKind) {
       const held = releaseThenHoldEndpoint(inputKind)
       if (held && data) {
+        if (inputBatcher.hasPendingValidation()) {
+          return holdAcceptedAfterValidation(data, inputKind)
+        }
+        inputBatcher.flush()
         return recoveryInputHold.enqueueAccepted(held, data, inputKind)
       }
       return sendInputAcceptedToRuntime(data)

@@ -14,6 +14,7 @@ export type TerminalMultiplexEvent =
       streamId: number
       streamGeneration?: string
       capabilities?: { ackOutputSourceRanges?: 1; outputPause?: 1; inputAck?: 1 }
+      inputLedgerId?: string
     }
   | { type: 'end'; streamId: number; verdict?: TerminalStreamEndVerdict }
   | { type: 'error'; streamId: number; message?: string }
@@ -139,6 +140,8 @@ export type RemoteRuntimeMultiplexedTerminal = {
   sendInput: (text: string, inputSeq?: number) => boolean
   // Why: until the host echoes `inputAck`, delivery of a sent byte is unknown and must never be replayed.
   acknowledgesInput: () => boolean
+  /** The host ledger that dedupes this stream's input; a different one has no record of earlier sends. */
+  inputLedgerId: () => string | null
   resize: (cols: number, rows: number) => boolean
   claimViewport: (cols: number, rows: number) => boolean
   setOutputPaused: (paused: boolean) => boolean
@@ -161,6 +164,7 @@ export type RemoteRuntimeMultiplexedTerminalState = {
   acknowledgeOutputSourceRanges: boolean
   supportsOutputPause: boolean
   supportsInputAck: boolean
+  inputLedgerId: string | null
   outputPaused: boolean
   streamGeneration: string | null
   sourceAckedEndByte: number
