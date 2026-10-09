@@ -63,8 +63,11 @@ export type RemoteRuntimeMultiplexedTerminalCallbacks = {
     driver: { kind: 'idle' } | { kind: 'desktop' } | { kind: 'mobile'; clientId: string }
   ) => void
   onWriteUnavailable?: () => void
-  /** The host applied every sequenced input up to `inputSeq` (negotiated streams only). */
-  onInputAcknowledged?: (inputSeq: number) => void
+  /**
+   * The host settled sequenced input through `inputSeq` (negotiated streams only); `applied` is
+   * false when that write failed with unknown delivery, so it must be neither replayed nor reported sent.
+   */
+  onInputAcknowledged?: (inputSeq: number, applied: boolean) => void
   onTransportClose?: (event: { recoverable: boolean; retryWithBackoff?: boolean }) => void
 }
 

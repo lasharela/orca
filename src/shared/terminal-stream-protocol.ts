@@ -33,8 +33,20 @@ export enum TerminalStreamOpcode {
   SetOutputPaused = 16,
   // Negotiated per stream because older clients reject unknown opcodes.
   WriteUnavailable = 17,
-  // Host->client; `seq` is the client input sequence the host applied. Sent only after `inputAck` negotiation.
+  // Host->client; `seq` is the client input sequence the host settled (see the payload helpers below). Sent only after `inputAck` negotiation.
   InputAck = 18
+}
+
+const INPUT_ACK_DELIVERY_UNKNOWN = 1
+
+/** InputAck payload for a write that failed after it may have written; the client must not replay it. */
+export function encodeTerminalInputAckDeliveryUnknown(): Uint8Array {
+  return Uint8Array.of(INPUT_ACK_DELIVERY_UNKNOWN)
+}
+
+/** An empty InputAck payload means the host applied the input. */
+export function isTerminalInputAckDeliveryUnknown(payload: Uint8Array): boolean {
+  return payload[0] === INPUT_ACK_DELIVERY_UNKNOWN
 }
 
 export type TerminalStreamFrame = {

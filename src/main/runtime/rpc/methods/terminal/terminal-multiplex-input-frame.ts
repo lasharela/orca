@@ -3,7 +3,10 @@ import {
   type TerminalStreamFrame
 } from '../../../../../shared/terminal-stream-protocol'
 import { isTerminalInputLockedForClient, sendTerminalStreamInput } from './terminal-input-delivery'
-import type { TerminalInputSequenceLedger } from './terminal-input-sequence-ledger'
+import type {
+  TerminalInputSequenceLedger,
+  TerminalInputWriteOutcome
+} from './terminal-input-sequence-ledger'
 import type { TerminalMultiplexConnection } from './terminal-multiplex-connection'
 import type { TerminalMultiplexStream } from './terminal-stream-types'
 
@@ -17,13 +20,14 @@ export function handleMultiplexInputFrame(
   const text = decodeTerminalStreamText(frame.payload)
   // Mobile already has the higher-priority floor, so a rejected desktop claim must not suppress later phone input.
   const inputClaimTail = stream.isMobile ? Promise.resolve(true) : stream.desktopClaimTail
-  const deliver = async (): Promise<void> => {
+  // Why 'applied' for locked or unclaimed input: it is dropped by policy, and a replay must not run it later.
+  const deliver = async (): Promise<TerminalInputWriteOutcome> => {
     if (!text || isTerminalInputLockedForClient(runtime, stream.ptyId, stream.client)) {
-      return
+      return 'applied'
     }
     const claimed = await inputClaimTail
     if (!claimed || isTerminalInputLockedForClient(runtime, stream.ptyId, stream.client)) {
-      return
+      return 'applied'
     }
     const outcome = await sendTerminalStreamInput(runtime, {
       terminal: stream.terminal,
@@ -32,6 +36,11 @@ export function handleMultiplexInputFrame(
       isMobile: stream.isMobile
     })
     state.notifyStreamWriteUnavailable(stream, outcome)
+    return outcome === 'delivered'
+      ? 'applied'
+      : outcome === 'rejected'
+        ? 'refused'
+        : 'delivery-unknown'
   }
   if (stream.inputSessionId === null || frame.seq <= 0) {
     void deliver()
@@ -42,8 +51,13 @@ export function handleMultiplexInputFrame(
     stream.ptyId,
     stream.inputSessionId,
     inputSeq,
+    stream,
     deliver
   )
   // Why ack a duplicate too: the client replays until acked, and the first copy's ack may have died with its connection.
-  void settled.then(() => state.sendInputAck(stream, inputSeq))
+  void settled.then((admission) => {
+    if (admission !== 'unacked') {
+      state.sendInputAck(stream, inputSeq, admission === 'delivery-unknown')
+    }
+  })
 }

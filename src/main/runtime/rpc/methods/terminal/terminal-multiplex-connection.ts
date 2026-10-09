@@ -50,7 +50,11 @@ export type TerminalMultiplexFrameDelivery = {
     stream: TerminalMultiplexStream,
     outcome: 'delivered' | 'rejected' | 'failed'
   ) => void
-  sendInputAck: (stream: TerminalMultiplexStream, inputSeq: number) => void
+  sendInputAck: (
+    stream: TerminalMultiplexStream,
+    inputSeq: number,
+    deliveryUnknown: boolean
+  ) => void
   sendResizedFrame: (
     stream: TerminalMultiplexStream,
     event: { cols: number; rows: number; displayMode: string; reason: string; seq?: number }

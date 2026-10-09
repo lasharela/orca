@@ -8,7 +8,13 @@ import {
 // oldest bytes go and the gap check below stops a partial replay.
 export const REMOTE_RUNTIME_INPUT_JOURNAL_MAX_CODE_UNITS = 1024 * 1024
 
-export type SequencedRemoteRuntimeInput = { seq: number; text: string; queryReply: boolean }
+export type SequencedRemoteRuntimeInput = {
+  seq: number
+  text: string
+  queryReply: boolean
+  // Its caller gave up on it; a replay must not deliver what was already reported failed.
+  cancelled: boolean
+}
 
 /** Input sent to a remote pane but not yet acknowledged by its host, keyed by input sequence. */
 export type RemoteRuntimeInputJournal = {
@@ -23,9 +29,12 @@ export type RemoteRuntimeInputJournal = {
     text: string,
     queryReply?: boolean
   ) => number
-  acknowledge: (seq: number) => void
-  /** Resolves true once the host acknowledges `seq`, false if the journal gives it up first. */
+  /** `applied` is false when the host's write of `seq` failed with unknown delivery. */
+  acknowledge: (seq: number, applied?: boolean) => void
+  /** Resolves true once the host applies `seq`, false if it fails or the journal gives it up first. */
   whenAcknowledged: (seq: number) => Promise<boolean>
+  /** Gives up `seq` for its caller: settles it false and keeps it out of any later replay. */
+  cancel: (seq: number) => void
   /**
    * Input still owed to `bound`, oldest first. Clears itself when it belongs elsewhere, has a gap,
    * or was sent to a host ledger other than `ledgerId` (that ledger cannot dedupe it).
@@ -80,7 +89,7 @@ export function createRemoteRuntimeInputJournal(): RemoteRuntimeInputJournal {
       ledger = ledgerId
       const seq = nextSeq
       nextSeq += 1
-      entries.push({ seq, text, queryReply })
+      entries.push({ seq, text, queryReply, cancelled: false })
       codeUnits += text.length
       while (codeUnits > REMOTE_RUNTIME_INPUT_JOURNAL_MAX_CODE_UNITS && entries.length > 0) {
         const dropped = entries.shift()
@@ -91,7 +100,7 @@ export function createRemoteRuntimeInputJournal(): RemoteRuntimeInputJournal {
       }
       return seq
     },
-    acknowledge(seq) {
+    acknowledge(seq, applied = true) {
       if (seq <= ackedSeq || seq >= nextSeq) {
         return
       }
@@ -102,7 +111,19 @@ export function createRemoteRuntimeInputJournal(): RemoteRuntimeInputJournal {
         drop += 1
       }
       entries = entries.slice(drop)
+      if (!applied) {
+        waiters.get(seq)?.(false)
+        waiters.delete(seq)
+      }
       settleWaiters(seq, true)
+    },
+    cancel(seq) {
+      const entry = entries.find((candidate) => candidate.seq === seq)
+      if (entry) {
+        entry.cancelled = true
+      }
+      waiters.get(seq)?.(false)
+      waiters.delete(seq)
     },
     whenAcknowledged(seq) {
       // Why: callers ask right after record(), so a missing entry was already given up.

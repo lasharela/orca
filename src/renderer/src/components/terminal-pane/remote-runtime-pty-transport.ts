@@ -5,6 +5,7 @@ import {
   type RemoteRuntimeInputEndpoint
 } from './remote-runtime-recovery-input-hold'
 import { createRemoteRuntimeInputJournal } from './remote-runtime-input-journal'
+import type { AcceptedInputOptions } from './pty-preconnect-input-buffer'
 import type { TerminalInputKind } from '../../../../shared/terminal-input-kind'
 /* eslint-disable max-lines -- Why: remote PTY transport keeps lifecycle, JSON fallback, and binary stream wiring together so reconnect/destroy ordering stays testable as one behavior surface. */
 import type { RuntimeRpcResponse } from '../../../../shared/runtime-rpc-envelope'
@@ -451,19 +452,9 @@ export function createRemoteRuntimePtyTransport(
     const boundHandle = multiplexedStreamHandle
     if (stream.acknowledgesInput() && boundHandle) {
       replayUnacknowledgedInput(stream, boundHandle)
-    }
-    for (const segment of queued) {
-      if (stream.acknowledgesInput() && boundHandle) {
-        stream.sendInput(
-          segment.text,
-          inputJournal.record(
-            heldInputEndpoint(boundHandle),
-            stream.inputLedgerId(),
-            segment.text,
-            segment.queryReply
-          )
-        )
-      } else {
+      sendSequencedInput(stream, boundHandle, queued)
+    } else {
+      for (const segment of queued) {
         stream.sendInput(segment.text)
       }
     }
@@ -1512,7 +1503,8 @@ export function createRemoteRuntimePtyTransport(
   // Why: reserves this key's slot behind input still in size validation, which reaches the hold first.
   function holdAcceptedAfterValidation(
     data: string,
-    inputKind: TerminalInputKind
+    inputKind: TerminalInputKind,
+    options: AcceptedInputOptions | undefined
   ): Promise<boolean> {
     return new Promise<boolean>((resolve) => {
       let ran = false
@@ -1522,8 +1514,8 @@ export function createRemoteRuntimePtyTransport(
         const held = handle && shouldHoldInput() ? heldInputEndpoint(handle) : null
         resolve(
           held
-            ? recoveryInputHold.enqueueAccepted(held, data, inputKind)
-            : sendInputAcceptedToRuntime(data)
+            ? recoveryInputHold.enqueueAccepted(held, data, inputKind, options)
+            : sendInputAcceptedToRuntime(data, inputKind, options)
         )
       })
       // Why: a cleared batcher skips the reserved slot; settle instead of hanging the caller.
@@ -1554,7 +1546,7 @@ export function createRemoteRuntimePtyTransport(
       stream.inputLedgerId()
     )) {
       // Why: a query reply answers a query from before the outage; replaying it types garbage.
-      if (!entry.queryReply) {
+      if (!entry.queryReply && !entry.cancelled) {
         stream.sendInput(entry.text, entry.seq)
       }
     }
@@ -1599,9 +1591,14 @@ export function createRemoteRuntimePtyTransport(
     })
   }
 
-  async function sendInputAcceptedToRuntime(data: string): Promise<boolean> {
+  async function sendInputAcceptedToRuntime(
+    data: string,
+    _inputKind?: TerminalInputKind,
+    options?: AcceptedInputOptions
+  ): Promise<boolean> {
+    const signal = options?.signal
     const targetHandle = handle
-    if (!connected || !targetHandle || recoveryBlocksIo()) {
+    if (!connected || !targetHandle || recoveryBlocksIo() || signal?.aborted) {
       return false
     }
     if (!data) {
@@ -1629,13 +1626,16 @@ export function createRemoteRuntimePtyTransport(
     } catch {
       return false
     }
+    if (signal?.aborted) {
+      return false
+    }
     const stream = getCurrentMultiplexedStream(targetHandle)
     if (stream?.acknowledgesInput()) {
-      return sendSequencedInputAccepted(stream, targetHandle, text)
+      return sendSequencedInputAccepted(stream, targetHandle, text, signal)
     }
     try {
       for (const chunk of iterateTerminalInputChunks(text)) {
-        if (!connected || handle !== targetHandle || recoveryBlocksIo()) {
+        if (!connected || handle !== targetHandle || recoveryBlocksIo() || signal?.aborted) {
           return false
         }
         // Why: acknowledged sends order behind pending debounce text but must not collapse large paste back into one remote RPC.
@@ -1663,21 +1663,38 @@ export function createRemoteRuntimePtyTransport(
   function sendSequencedInputAccepted(
     stream: RemoteRuntimeMultiplexedTerminal,
     targetHandle: string,
-    text: string
+    text: string,
+    signal: AbortSignal | undefined
   ): Promise<boolean> {
     replayUnacknowledgedInput(stream, targetHandle)
-    const acknowledged: Promise<boolean>[] = []
-    for (const chunk of iterateTerminalInputChunks(text)) {
-      const seq = inputJournal.record(
-        heldInputEndpoint(targetHandle),
-        stream.inputLedgerId(),
-        chunk
-      )
-      acknowledged.push(inputJournal.whenAcknowledged(seq))
-      // Why ignore a failed send: it closes this stream, and the reattach replays the journal.
-      stream.sendInput(chunk, seq)
-    }
+    const seqs = sendSequencedInput(
+      stream,
+      targetHandle,
+      Array.from(iterateTerminalInputChunks(text), (chunk) => ({ text: chunk, queryReply: false }))
+    )
+    const acknowledged = seqs.map((seq) => inputJournal.whenAcknowledged(seq))
+    signal?.addEventListener('abort', () => seqs.forEach((seq) => inputJournal.cancel(seq)), {
+      once: true
+    })
     return Promise.all(acknowledged).then((results) => results.every(Boolean))
+  }
+
+  // Why one endpoint and ledger for the whole batch: a failed send retires the stream, which then
+  // reports no ledger, and recording against that would discard every earlier unacked byte.
+  function sendSequencedInput(
+    stream: RemoteRuntimeMultiplexedTerminal,
+    targetHandle: string,
+    segments: readonly { text: string; queryReply: boolean }[]
+  ): number[] {
+    const endpoint = heldInputEndpoint(targetHandle)
+    const ledgerId = stream.inputLedgerId()
+    let streamOpen = true
+    return segments.map((segment) => {
+      const seq = inputJournal.record(endpoint, ledgerId, segment.text, segment.queryReply)
+      // Why keep journaling after a failed send: the reattach replays the unsent rest in order.
+      streamOpen = streamOpen && stream.sendInput(segment.text, seq)
+      return seq
+    })
   }
 
   function notifyWriteUnavailable(): void {
@@ -1695,14 +1712,8 @@ export function createRemoteRuntimePtyTransport(
     const stream = getCurrentMultiplexedStream(targetHandle)
     if (stream?.acknowledgesInput()) {
       replayUnacknowledgedInput(stream, targetHandle)
-      const seq = inputJournal.record(
-        heldInputEndpoint(targetHandle),
-        stream.inputLedgerId(),
-        text,
-        queryReply
-      )
       // Why true even if unsent: a failed write closes this stream, and the reattach replays the journal.
-      stream.sendInput(text, seq)
+      sendSequencedInput(stream, targetHandle, [{ text, queryReply }])
       return true
     }
     if (stream?.sendInput(text)) {
@@ -2384,9 +2395,9 @@ export function createRemoteRuntimePtyTransport(
             notifyWriteUnavailable()
           }
         },
-        onInputAcknowledged: (inputSeq) => {
+        onInputAcknowledged: (inputSeq, applied) => {
           if (handle === subscribedHandle) {
-            inputJournal.acknowledge(inputSeq)
+            inputJournal.acknowledge(inputSeq, applied)
           }
         },
         onTransportClose: ({ recoverable, retryWithBackoff }) => {
@@ -2940,16 +2951,16 @@ export function createRemoteRuntimePtyTransport(
     // Why: query replies (CPR/DSR/DA/OSC) are read in raw mode with a short timeout; the 8ms debounce would miss it and echo the reply onto the prompt (#7329).
     sendInputImmediate: (data: string): boolean => sendInputImmediateNow(data),
 
-    sendInputAccepted(data, inputKind) {
+    sendInputAccepted(data, inputKind, options) {
       const held = releaseThenHoldEndpoint(inputKind)
       if (held && data) {
         if (inputBatcher.hasPendingValidation()) {
-          return holdAcceptedAfterValidation(data, inputKind)
+          return holdAcceptedAfterValidation(data, inputKind, options)
         }
         inputBatcher.flush()
-        return recoveryInputHold.enqueueAccepted(held, data, inputKind)
+        return recoveryInputHold.enqueueAccepted(held, data, inputKind, options)
       }
-      return sendInputAcceptedToRuntime(data)
+      return sendInputAcceptedToRuntime(data, inputKind, options)
     },
 
     // Why: a transport with an armed retry or a parked one owns this pane's recovery; a remount would race it (#21195).

@@ -10,15 +10,19 @@ import {
   decodeTerminalStreamFrame,
   encodeTerminalStreamFrame,
   encodeTerminalStreamJson,
-  encodeTerminalStreamText
+  encodeTerminalStreamText,
+  isTerminalInputAckDeliveryUnknown
 } from '../../../shared/terminal-stream-protocol'
 import { makeRequest, stubRuntime } from './terminal-multiplex-test-harness'
 
 type FrameHandler = (frame: NonNullable<ReturnType<typeof decodeTerminalStreamFrame>>) => void
 
+type ScriptedWrite = 'accept' | 'reject' | 'throw'
+
 function createRuntime(
   writes: string[],
-  writeGate: () => Promise<void> = async () => {}
+  writeGate: () => Promise<void> = async () => {},
+  scriptedWrites: ScriptedWrite[] = []
 ): OrcaRuntimeService {
   const registry = createSubscriptionRegistryDouble()
   return stubRuntime({
@@ -42,6 +46,13 @@ function createRuntime(
     updateDesktopViewport: vi.fn().mockResolvedValue(true),
     sendTerminal: vi.fn(async (_handle: string, action: { text?: string }) => {
       await writeGate()
+      const scripted = scriptedWrites.shift() ?? 'accept'
+      if (scripted === 'throw') {
+        throw new Error('ssh channel write failed')
+      }
+      if (scripted === 'reject') {
+        return { handle: 'terminal-1', accepted: false, bytesWritten: 0 }
+      }
       writes.push(action.text ?? '')
       return { handle: 'terminal-1', accepted: true, bytesWritten: action.text?.length ?? 0 }
     })
@@ -110,7 +121,21 @@ async function openConnection(
       binaryFrames
         .map((bytes) => decodeTerminalStreamFrame(bytes))
         .filter((frame) => frame?.opcode === TerminalStreamOpcode.InputAck)
-        .map((frame) => frame!.seq)
+        .map((frame) => frame!.seq),
+    deliveryUnknownAcks: () =>
+      binaryFrames
+        .map((bytes) => decodeTerminalStreamFrame(bytes))
+        .filter(
+          (frame) =>
+            frame?.opcode === TerminalStreamOpcode.InputAck &&
+            isTerminalInputAckDeliveryUnknown(frame.payload)
+        )
+        .map((frame) => frame!.seq),
+    writeUnavailableCount: () =>
+      binaryFrames.filter(
+        (bytes) =>
+          decodeTerminalStreamFrame(bytes)?.opcode === TerminalStreamOpcode.WriteUnavailable
+      ).length
   }
 }
 
@@ -141,6 +166,48 @@ describe('terminal multiplex sequenced input across reconnects', () => {
 
     await vi.waitFor(() => expect(replacement.inputAcks()).toEqual([2, 3]))
     expect(writes).toEqual(['PZ600-0', '12', '3\r'])
+  })
+
+  it('never acks a write the PTY refused, and writes it once the client replays it', async () => {
+    const writes: string[] = []
+    const dispatcher = new RpcDispatcher({
+      runtime: createRuntime(writes, async () => {}, ['accept', 'reject']),
+      methods: TERMINAL_METHODS
+    })
+    const subscribe = {
+      capabilities: { writeUnavailable: 1 as const, inputAck: 1 as const },
+      inputSessionId: 'pane-a'
+    }
+    const first = await openConnection(dispatcher, 'conn-first', subscribe)
+    first.sendInput(1, 'echo a\r')
+    first.sendInput(2, 'echo b\r')
+    first.sendInput(3, 'echo c\r')
+    await vi.waitFor(() => expect(first.writeUnavailableCount()).toBe(1))
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    // Neither the refused seq 2 nor seq 3 behind it may be acked, or the client drops them.
+    expect(first.inputAcks()).toEqual([1])
+    expect(writes).toEqual(['echo a\r'])
+
+    const replacement = await openConnection(dispatcher, 'conn-replacement', subscribe)
+    replacement.sendInput(2, 'echo b\r')
+    replacement.sendInput(3, 'echo c\r')
+    await vi.waitFor(() => expect(replacement.inputAcks()).toEqual([2, 3]))
+    expect(writes).toEqual(['echo a\r', 'echo b\r', 'echo c\r'])
+  })
+
+  it('tells the client a thrown write has unknown delivery instead of acking it as applied', async () => {
+    const writes: string[] = []
+    const dispatcher = new RpcDispatcher({
+      runtime: createRuntime(writes, async () => {}, ['throw']),
+      methods: TERMINAL_METHODS
+    })
+    const subscribe = { capabilities: { inputAck: 1 as const }, inputSessionId: 'pane-a' }
+    const connection = await openConnection(dispatcher, 'conn-1', subscribe)
+    connection.sendInput(1, 'make deploy\r')
+    connection.sendInput(2, 'ls\r')
+    await vi.waitFor(() => expect(connection.inputAcks()).toEqual([1, 2]))
+    expect(connection.deliveryUnknownAcks()).toEqual([1])
+    expect(writes).toEqual(['ls\r'])
   })
 
   it('names its input ledger so a restarted runtime is never mistaken for the one that applied input', async () => {

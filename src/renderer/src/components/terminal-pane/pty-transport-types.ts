@@ -17,7 +17,7 @@ import type { TerminalPanePlacement } from '../../../../shared/terminal-pane-pla
 import type { ExecutionHostId } from '../../../../shared/execution-host'
 import type { PtyDataMeta } from './pty-dispatcher'
 import type { RemoteRuntimeSnapshotOutcome } from '../../runtime/remote-runtime-terminal-multiplexer'
-import type { PtyPreconnectInputEntry } from './pty-preconnect-input-buffer'
+import type { AcceptedInputOptions, PtyPreconnectInputEntry } from './pty-preconnect-input-buffer'
 
 export type PtyBufferSnapshot = {
   data: string
@@ -200,7 +200,11 @@ export type PtyTransport = {
   // this is `sendInput` for them; the remote transport flushes pending input
   // (preserving order) and sends the reply immediately.
   sendInputImmediate: (data: string) => boolean
-  sendInputAccepted?: (data: string, inputKind: TerminalInputKind) => Promise<boolean>
+  sendInputAccepted?: (
+    data: string,
+    inputKind: TerminalInputKind,
+    options?: AcceptedInputOptions
+  ) => Promise<boolean>
   /** Settles retained pre-connect input when a deferred spawn is abandoned before connect. */
   abandonPreconnectInput?: () => void
   claimViewport?: (cols: number, rows: number) => boolean

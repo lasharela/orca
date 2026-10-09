@@ -10,6 +10,9 @@ import {
   type MultiplexSubscriptionCallbacks
 } from './remote-runtime-pty-transport-test-harness'
 import { REMOTE_RUNTIME_AUTO_RECOVERY_TIMEOUT_MS } from './remote-runtime-pty-recovery-state'
+import { runTerminalPasteOperationWithTimeout } from './terminal-paste-operation-timeout'
+import { writeTerminalPastePtyInput } from './terminal-pty-paste-writer'
+import { TERMINAL_REMOTE_PASTE_OPERATION_TIMEOUT_MS } from './terminal-paste-limits'
 
 let subscriptionCallbacks: MultiplexSubscriptionCallbacks = null
 let resolvedPaneHandle = 'terminal-1'
@@ -73,14 +76,36 @@ function attachStream(
   emitSnapshot(streamId, 'prompt$ ')
 }
 
-function emitInputAck(streamId: number, seq: number): void {
+function emitInputAck(streamId: number, seq: number, payload = new Uint8Array()): void {
   subscriptionCallbacks?.onBinary?.(
     encodeTerminalStreamFrame({
       opcode: TerminalStreamOpcode.InputAck,
       streamId,
       seq,
-      payload: new Uint8Array()
+      payload
     })
+  )
+}
+
+/** Makes the `failAt`-th Input frame sent from now on throw, as a socket that died mid-write does. */
+function failInputFrame(failAt: number): void {
+  let inputs = 0
+  subscriptionSendBinary.mockImplementation((bytes: Uint8Array) => {
+    if (decodeTerminalStreamFrame(bytes)?.opcode === TerminalStreamOpcode.Input) {
+      inputs += 1
+      if (inputs === failAt) {
+        subscriptionSendBinary.mockImplementation(() => {})
+        throw new Error('socket closed')
+      }
+    }
+  })
+}
+
+/** One chunked-paste write, bounded by the remote paste timeout like the paste executor's. */
+function pasteChunk(transport: Parameters<typeof writeTerminalPastePtyInput>[0], data: string) {
+  return runTerminalPasteOperationWithTimeout(
+    (signal) => writeTerminalPastePtyInput(transport, data, 'driving', signal),
+    TERMINAL_REMOTE_PASTE_OPERATION_TIMEOUT_MS
   )
 }
 
@@ -282,4 +307,113 @@ describe('remote pane input across a silent outage', () => {
       vi.useRealTimers()
     }
   })
+  it('never delivers a paste chunk held past its caller timeout under the disconnected banner', async () => {
+    vi.useFakeTimers()
+    try {
+      const { transport } = await connectPane({ inputAck: 1 })
+      let hostReachable = false
+      runtimeSubscribe.mockImplementation(
+        async (_args: unknown, callbacks: NonNullable<MultiplexSubscriptionCallbacks>) => {
+          if (!hostReachable) {
+            throw Object.assign(new Error('Could not connect to the remote Orca runtime.'), {
+              code: 'remote_runtime_unavailable'
+            })
+          }
+          subscriptionCallbacks = callbacks
+          queueMicrotask(emitMultiplexReady)
+          return { unsubscribe: vi.fn(), sendBinary: subscriptionSendBinary }
+        }
+      )
+      subscriptionCallbacks?.onClose?.()
+      await vi.advanceTimersByTimeAsync(REMOTE_RUNTIME_AUTO_RECOVERY_TIMEOUT_MS + 1_000)
+      expect(transport.getRecoveryState?.().phase).toBe('disconnected')
+
+      const paste = pasteChunk(transport, '\x1b[200~echo one\recho two\r')
+      await vi.advanceTimersByTimeAsync(TERMINAL_REMOTE_PASTE_OPERATION_TIMEOUT_MS + 10_000)
+      await expect(paste).resolves.toEqual({ timedOut: true })
+      // Typed after the paste error: still held for the same terminal.
+      transport.sendInput('ls\r', 'driving')
+
+      hostReachable = true
+      expect(transport.retryRecovery?.()).toBe(true)
+      await vi.waitFor(() => expect(subscribeFrameCount()).toBe(2))
+      attachStream(latestSubscribePayload().streamId, { inputAck: 1 })
+      await vi.advanceTimersByTimeAsync(50)
+
+      expect(
+        sentInputs(2)
+          .map((input) => input.text)
+          .join('')
+      ).toBe('ls\r')
+      transport.destroy?.()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('never replays a paste chunk the dead stream took after its caller timed out', async () => {
+    vi.useFakeTimers()
+    try {
+      const { transport } = await connectPane({ inputAck: 1 })
+      const paste = pasteChunk(transport, '\x1b[200~echo one\r')
+      await vi.advanceTimersByTimeAsync(20)
+      expect(sentText()).toBe('\x1b[200~echo one\r')
+      // The link goes silent before the host acks the chunk; the stall watchdog starts recovery.
+      await vi.advanceTimersByTimeAsync(TERMINAL_REMOTE_PASTE_OPERATION_TIMEOUT_MS + 1_000)
+      await expect(paste).resolves.toEqual({ timedOut: true })
+      expect(subscribeFrameCount()).toBeGreaterThan(1)
+      transport.sendInput('ls\r', 'driving')
+
+      const reattach = subscribeFrameCount()
+      attachStream(latestSubscribePayload().streamId, { inputAck: 1 })
+      await vi.advanceTimersByTimeAsync(50)
+
+      expect(sentInputs(reattach).map((input) => input.text)).toEqual(['ls\r'])
+      transport.destroy?.()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('reports an accepted write the host failed with unknown delivery as not sent, and never replays it', async () => {
+    const { transport, streamId } = await connectPane({ inputAck: 1 })
+    const write = transport.sendInputAccepted?.('make deploy\r', 'driving')
+    await vi.waitFor(() => expect(sentInputs()).toHaveLength(1))
+    emitInputAck(streamId, sentInputs()[0].seq, Uint8Array.of(1))
+    await expect(write).resolves.toBe(false)
+
+    subscriptionCallbacks?.onClose?.()
+    await vi.waitFor(() => expect(runtimeSubscribe).toHaveBeenCalledTimes(2))
+    await reconnect({ inputAck: 1 }, 2)
+    transport.sendInput('ls\r', 'driving')
+    await vi.waitFor(() => expect(sentInputs(2).map((input) => input.text)).toEqual(['ls\r']))
+    transport.destroy?.()
+  })
+
+  it.each([1, 2])(
+    'keeps earlier typing and the whole draft when chunk %i of an accepted write fails to send',
+    async (failingChunk) => {
+      const { transport } = await connectPane({ inputAck: 1 })
+      transport.sendInput('echo previous\r', 'driving')
+      await vi.waitFor(() => expect(sentInputs()).toHaveLength(1))
+      // A 48 KiB startup draft splits into three 16 KiB chunks.
+      const draft = `${'a'.repeat(16 * 1024)}${'b'.repeat(16 * 1024)}${'c'.repeat(16 * 1024)}`
+      failInputFrame(failingChunk)
+      const write = transport.sendInputAccepted?.(draft, 'driving')
+
+      await vi.waitFor(() => expect(runtimeSubscribe).toHaveBeenCalledTimes(2))
+      await reconnect({ inputAck: 1 }, 2)
+      await vi.waitFor(() =>
+        expect(
+          sentInputs(2)
+            .map((input) => input.text)
+            .join('')
+        ).toBe(`echo previous\r${draft}`)
+      )
+      const replayed = sentInputs(2)
+      emitInputAck(latestSubscribePayload().streamId, replayed.at(-1)?.seq ?? 0)
+      await expect(write).resolves.toBe(true)
+      transport.destroy?.()
+    }
+  )
 })

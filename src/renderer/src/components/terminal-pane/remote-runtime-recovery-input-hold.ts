@@ -1,6 +1,7 @@
 import type { TerminalInputKind } from '../../../../shared/terminal-input-kind'
 import {
   createPtyPreconnectInputBuffer,
+  type AcceptedInputOptions,
   type PtyPreconnectInputBuffer
 } from './pty-preconnect-input-buffer'
 
@@ -14,7 +15,11 @@ type HeldInputWriter = {
   isCurrent: () => boolean
   sendInput: (data: string, inputKind: TerminalInputKind) => boolean
   sendInputImmediate: (data: string) => boolean
-  sendInputAccepted: (data: string, inputKind: TerminalInputKind) => Promise<boolean>
+  sendInputAccepted: (
+    data: string,
+    inputKind: TerminalInputKind,
+    options?: AcceptedInputOptions
+  ) => Promise<boolean>
 }
 
 export type RemoteRuntimeRecoveryInputHold = {
@@ -27,7 +32,8 @@ export type RemoteRuntimeRecoveryInputHold = {
   enqueueAccepted: (
     endpoint: RemoteRuntimeInputEndpoint,
     data: string,
-    inputKind: TerminalInputKind
+    inputKind: TerminalInputKind,
+    options?: AcceptedInputOptions
   ) => Promise<boolean>
   /** Delivers held input to the endpoint it was typed into, or drops it if the pane rebound elsewhere. */
   release: (bound: RemoteRuntimeInputEndpoint, writer: HeldInputWriter) => void
@@ -76,8 +82,8 @@ export function createRemoteRuntimeRecoveryInputHold(): RemoteRuntimeRecoveryInp
     isHolding: () => held?.buffer.isBuffering() === true,
     enqueue: (endpoint, data, inputKind) =>
       bufferFor(endpoint).enqueue(data, 'ordinary', inputKind),
-    enqueueAccepted: (endpoint, data, inputKind) =>
-      bufferFor(endpoint).enqueueAccepted(data, inputKind),
+    enqueueAccepted: (endpoint, data, inputKind, options) =>
+      bufferFor(endpoint).enqueueAccepted(data, inputKind, undefined, options),
     release(bound, writer) {
       const current = held
       if (!current) {
