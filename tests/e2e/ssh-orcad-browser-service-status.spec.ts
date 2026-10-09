@@ -113,21 +113,34 @@ test('an unavailable browser on a responding managed host does not report a serv
         { timeout: 60_000 }
       )
       .toMatch(/^runtime:/)
-    const retained = await page.evaluate((worktreeId) => {
-      const state = window.__store?.getState()
-      const tab = state?.browserTabsByWorktree[worktreeId]?.[0]
-      const repo = state?.repos.find((repo) =>
-        (state.worktreesByRepo[repo.id] ?? []).some((worktree) => worktree.id === worktreeId)
-      )
-      if (repo?.executionHostId) {
-        state?.setActiveWorktree(worktreeId, repo.executionHostId)
+    // Retained desktop pages stay local after conversion; place this one on the managed host.
+    const remoteTabId = await page.evaluate(
+      ({ worktreeId, environmentId, url }) => {
+        const state = window.__store?.getState()
+        const repo = state?.repos.find((repo) =>
+          (state.worktreesByRepo[repo.id] ?? []).some((worktree) => worktree.id === worktreeId)
+        )
+        if (!state || !repo?.executionHostId) {
+          throw new Error('Missing converted workspace')
+        }
+        state.setActiveWorktree(worktreeId, repo.executionHostId)
+        const tab = state.createBrowserTab(worktreeId, url, {
+          title: 'Managed host browser',
+          activate: true,
+          browserRuntimeEnvironmentId: environmentId
+        })
+        if (tab.activePageId) {
+          state.focusBrowserTabInWorktree(worktreeId, tab.activePageId, { surfacePane: true })
+        }
+        return tab.id
+      },
+      {
+        worktreeId: remote.worktreeId,
+        environmentId: environment.id,
+        url: `${SSH_REMOTE_ONLY_ORIGIN}/login`
       }
-      if (tab?.activePageId) {
-        state?.focusBrowserTabInWorktree(worktreeId, tab.activePageId, { surfacePane: true })
-      }
-      return tab?.id ?? null
-    }, remote.worktreeId)
-    expect(retained).toBe(tabId)
+    )
+    expect(remoteTabId).not.toBe(tabId)
     const notice = page.getByTestId('remote-browser-stream-error')
     await expect(notice).toBeVisible({ timeout: 30_000 })
     await page.screenshot({ path: testInfo.outputPath('browser-service-status.png') })
