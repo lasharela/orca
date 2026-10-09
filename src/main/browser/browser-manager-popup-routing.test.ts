@@ -288,6 +288,65 @@ describe('browserManager', () => {
     expect(shellOpenExternalMock).not.toHaveBeenCalled()
   })
 
+  it('opens window.open with only noopener/noreferrer as a tab, but keeps sized popups', () => {
+    const rendererSendMock = vi.fn()
+    const guest = {
+      id: 143,
+      isDestroyed: vi.fn(() => false),
+      getType: vi.fn(() => 'webview'),
+      setBackgroundThrottling: guestSetBackgroundThrottlingMock,
+      setWindowOpenHandler: guestSetWindowOpenHandlerMock,
+      on: guestOnMock,
+      off: guestOffMock,
+      openDevTools: guestOpenDevToolsMock
+    }
+    webContentsFromIdMock.mockImplementation((id: number) => {
+      if (id === guest.id) {
+        return guest
+      }
+      if (id === rendererWebContentsId) {
+        return { isDestroyed: vi.fn(() => false), send: rendererSendMock }
+      }
+      return null
+    })
+
+    browserManager.attachGuestPolicies(guest as never)
+    browserManager.registerGuest({
+      browserPageId: 'browser-1',
+      webContentsId: guest.id,
+      rendererWebContentsId
+    })
+
+    const handler = guestSetWindowOpenHandlerMock.mock.calls[0][0] as (details: {
+      url: string
+      frameName: string
+      features: string
+      disposition: string
+    }) => { action: 'allow' | 'deny' }
+    expect(
+      handler({
+        url: 'https://docs.example.com/guide',
+        frameName: '',
+        features: 'noopener,noreferrer',
+        disposition: 'foreground-tab'
+      })
+    ).toEqual({ action: 'deny' })
+    expect(rendererSendMock).toHaveBeenCalledWith('browser:open-link-in-orca-tab', {
+      browserPageId: 'browser-1',
+      url: 'https://docs.example.com/guide'
+    })
+    expect(openPopupWithOriginBarMock).not.toHaveBeenCalled()
+
+    expect(
+      handler({
+        url: 'https://sso.example.com/auth',
+        frameName: '',
+        features: 'noopener,width=500,height=600',
+        disposition: 'new-window'
+      })
+    ).toMatchObject({ action: 'allow' })
+  })
+
   it('shares the page-initiated tab budget across the whole opener popup tree', () => {
     const rendererSendMock = vi.fn()
     const guest = {
