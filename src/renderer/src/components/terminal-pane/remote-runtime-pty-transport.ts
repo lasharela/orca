@@ -4,7 +4,8 @@ import {
   createRemoteRuntimeRecoveryInputHold,
   type RemoteRuntimeInputEndpoint
 } from './remote-runtime-recovery-input-hold'
-import { createRemoteRuntimeInputJournal } from './remote-runtime-input-journal'
+import { createRemoteRuntimeInputJournal, replayTextOf } from './remote-runtime-input-journal'
+import { createRemoteRuntimeInputResendScheduler } from './remote-runtime-input-resend-scheduler'
 import type { AcceptedInputOptions } from './pty-preconnect-input-buffer'
 import type { TerminalInputKind } from '../../../../shared/terminal-input-kind'
 /* eslint-disable max-lines -- Why: remote PTY transport keeps lifecycle, JSON fallback, and binary stream wiring together so reconnect/destroy ordering stays testable as one behavior surface. */
@@ -304,6 +305,11 @@ export function createRemoteRuntimePtyTransport(
   const inputJournal = createRemoteRuntimeInputJournal()
   // Why: replay owed input exactly once per stream, before anything new is sequenced on it.
   let inputJournalReplayedStream: RemoteRuntimeMultiplexedTerminal | null = null
+  const inputResend = createRemoteRuntimeInputResendScheduler({
+    resend: (fromSeq) => resendInputFrom(fromSeq),
+    // Why remount only now: refusals this long mean the host lost the terminal, not a brief blip.
+    giveUp: () => notifyWriteUnavailable()
+  })
   const recovery = new RemoteRuntimePtyRecoveryState(() => {
     if (recovery.currentPhase === 'disposed') {
       clearPublishedHandleWait()
@@ -1480,6 +1486,7 @@ export function createRemoteRuntimePtyTransport(
   function discardPendingInput(): void {
     recoveryInputHold.discard()
     inputJournal.discard()
+    inputResend.cancel()
   }
 
   // Why: these bytes never reached a stream, so holding them for the reattach cannot duplicate them.
@@ -1536,6 +1543,7 @@ export function createRemoteRuntimePtyTransport(
       return
     }
     inputJournalReplayedStream = stream
+    inputResend.cancel()
     if (!stream.acknowledgesInput()) {
       // Why: without acks, delivery of earlier bytes is unknown; replaying could run them twice.
       inputJournal.discard()
@@ -1545,10 +1553,27 @@ export function createRemoteRuntimePtyTransport(
       heldInputEndpoint(boundHandle),
       stream.inputLedgerId()
     )) {
-      // Why: a query reply answers a query from before the outage; replaying it types garbage.
-      if (!entry.queryReply && !entry.cancelled) {
-        stream.sendInput(entry.text, entry.seq)
-      }
+      // Why empty, not skipped: the host writes only in sequence order, so each slot is filled.
+      stream.sendInput(replayTextOf(entry), entry.seq)
+    }
+  }
+
+  // Why the same stream: the host refused or saw a gap, and a remount would discard the journal.
+  function resendInputFrom(fromSeq: number): void {
+    const boundHandle = handle
+    if (destroyed || terminalEnded || !connected || !boundHandle || recoveryBlocksIo()) {
+      return
+    }
+    const stream = getCurrentMultiplexedStream(boundHandle)
+    if (!stream?.acknowledgesInput()) {
+      return
+    }
+    for (const segment of inputJournal.resendFrom(
+      heldInputEndpoint(boundHandle),
+      stream.inputLedgerId(),
+      fromSeq
+    )) {
+      stream.sendInput(segment.text, segment.seq)
     }
   }
 
@@ -1617,7 +1642,8 @@ export function createRemoteRuntimePtyTransport(
       }
     }
     // Why: normal sendInput may be awaiting size validation; drain it before acknowledged writes so terminal bytes stay ordered.
-    const text = `${inputBatcher.takePending()}${data}`
+    const pendingTyping = inputBatcher.takePending()
+    const text = `${pendingTyping}${data}`
     try {
       const tooLarge = isTerminalInputTooLargeWithDeferredMeasurement(text)
       if (typeof tooLarge === 'boolean' ? tooLarge : await tooLarge) {
@@ -1631,7 +1657,7 @@ export function createRemoteRuntimePtyTransport(
     }
     const stream = getCurrentMultiplexedStream(targetHandle)
     if (stream?.acknowledgesInput()) {
-      return sendSequencedInputAccepted(stream, targetHandle, text, signal)
+      return sendSequencedInputAccepted(stream, targetHandle, pendingTyping, data, signal)
     }
     try {
       for (const chunk of iterateTerminalInputChunks(text)) {
@@ -1663,10 +1689,20 @@ export function createRemoteRuntimePtyTransport(
   function sendSequencedInputAccepted(
     stream: RemoteRuntimeMultiplexedTerminal,
     targetHandle: string,
+    pendingTyping: string,
     text: string,
     signal: AbortSignal | undefined
   ): Promise<boolean> {
     replayUnacknowledgedInput(stream, targetHandle)
+    // Why its own sequences: aborting the caller's bytes must not cancel typing batched ahead of them.
+    sendSequencedInput(
+      stream,
+      targetHandle,
+      Array.from(iterateTerminalInputChunks(pendingTyping), (chunk) => ({
+        text: chunk,
+        queryReply: false
+      }))
+    )
     const seqs = sendSequencedInput(
       stream,
       targetHandle,
@@ -2398,6 +2434,12 @@ export function createRemoteRuntimePtyTransport(
         onInputAcknowledged: (inputSeq, applied) => {
           if (handle === subscribedHandle) {
             inputJournal.acknowledge(inputSeq, applied)
+            inputResend.noteProgress()
+          }
+        },
+        onInputResendRequested: (fromSeq) => {
+          if (isCurrentSubscription()) {
+            inputResend.request(fromSeq)
           }
         },
         onTransportClose: ({ recoverable, retryWithBackoff }) => {

@@ -68,6 +68,8 @@ export type RemoteRuntimeMultiplexedTerminalCallbacks = {
    * false when that write failed with unknown delivery, so it must be neither replayed nor reported sent.
    */
   onInputAcknowledged?: (inputSeq: number, applied: boolean) => void
+  /** The host wrote nothing from `fromSeq` on (a refusal or a gap) and needs that input sent again, in order. */
+  onInputResendRequested?: (fromSeq: number) => void
   onTransportClose?: (event: { recoverable: boolean; retryWithBackoff?: boolean }) => void
 }
 

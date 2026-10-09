@@ -8,6 +8,9 @@ import {
 // oldest bytes go and the gap check below stops a partial replay.
 export const REMOTE_RUNTIME_INPUT_JOURNAL_MAX_CODE_UNITS = 1024 * 1024
 
+// Why bounded: one resend pass fills at most this many slots; the host asks again for the rest.
+export const REMOTE_RUNTIME_INPUT_RESEND_MAX_SEGMENTS = 4096
+
 export type SequencedRemoteRuntimeInput = {
   seq: number
   text: string
@@ -43,7 +46,22 @@ export type RemoteRuntimeInputJournal = {
     bound: RemoteRuntimeInputEndpoint,
     ledgerId: string | null
   ) => readonly SequencedRemoteRuntimeInput[]
+  /**
+   * Every sequence from `fromSeq` the host has not acked, for a host that wrote nothing from there
+   * on. Input that must not run (given up, discarded, or a stale query reply) is sent as empty
+   * text: the host admits sequences only in order, so each slot must still be filled.
+   */
+  resendFrom: (
+    bound: RemoteRuntimeInputEndpoint,
+    ledgerId: string | null,
+    fromSeq: number
+  ) => readonly { seq: number; text: string }[]
   discard: () => void
+}
+
+/** What a replay sends for `entry`: input that must not run still fills its slot, empty. */
+export function replayTextOf(entry: SequencedRemoteRuntimeInput): string {
+  return entry.queryReply || entry.cancelled ? '' : entry.text
 }
 
 export function createRemoteRuntimeInputJournal(): RemoteRuntimeInputJournal {
@@ -54,6 +72,8 @@ export function createRemoteRuntimeInputJournal(): RemoteRuntimeInputJournal {
   let codeUnits = 0
   let nextSeq = 1
   let ackedSeq = 0
+  // Unlike ackedSeq, never advanced by a discard: the host may still lack the discarded sequences.
+  let hostAckedSeq = 0
   const waiters = new Map<number, (acknowledged: boolean) => void>()
 
   const settleWaiters = (throughSeq: number, acknowledged: boolean): void => {
@@ -101,7 +121,11 @@ export function createRemoteRuntimeInputJournal(): RemoteRuntimeInputJournal {
       return seq
     },
     acknowledge(seq, applied = true) {
-      if (seq <= ackedSeq || seq >= nextSeq) {
+      if (seq >= nextSeq) {
+        return
+      }
+      hostAckedSeq = Math.max(hostAckedSeq, seq)
+      if (seq <= ackedSeq) {
         return
       }
       ackedSeq = seq
@@ -135,21 +159,45 @@ export function createRemoteRuntimeInputJournal(): RemoteRuntimeInputJournal {
       })
     },
     unacknowledgedFor(bound, ledgerId) {
-      if (entries.length === 0) {
-        return entries
-      }
-      if (
-        !endpoint ||
-        !isSameRemoteRuntimeInputEndpoint(endpoint, bound) ||
-        // Why: a restarted host runtime keeps the PTY but not the ledger, so it would run these again.
-        ledger !== ledgerId ||
-        // Why: replaying around a gap would deliver later keys without the earlier ones.
-        entries[0].seq !== ackedSeq + 1
+      return owedTo(bound, ledgerId)
+    },
+    resendFrom(bound, ledgerId, fromSeq) {
+      const owed = owedTo(bound, ledgerId)
+      const segments: { seq: number; text: string }[] = []
+      let index = 0
+      for (
+        let seq = Math.max(fromSeq, hostAckedSeq + 1);
+        seq < nextSeq && segments.length < REMOTE_RUNTIME_INPUT_RESEND_MAX_SEGMENTS;
+        seq += 1
       ) {
-        discard()
+        while (index < owed.length && owed[index].seq < seq) {
+          index += 1
+        }
+        const entry = owed[index]?.seq === seq ? owed[index] : undefined
+        segments.push({ seq, text: entry ? replayTextOf(entry) : '' })
       }
-      return entries
+      return segments
     },
     discard
+  }
+
+  function owedTo(
+    bound: RemoteRuntimeInputEndpoint,
+    ledgerId: string | null
+  ): readonly SequencedRemoteRuntimeInput[] {
+    if (entries.length === 0) {
+      return entries
+    }
+    if (
+      !endpoint ||
+      !isSameRemoteRuntimeInputEndpoint(endpoint, bound) ||
+      // Why: a restarted host runtime keeps the PTY but not the ledger, so it would run these again.
+      ledger !== ledgerId ||
+      // Why: replaying around a gap would deliver later keys without the earlier ones.
+      entries[0].seq !== ackedSeq + 1
+    ) {
+      discard()
+    }
+    return entries
   }
 }

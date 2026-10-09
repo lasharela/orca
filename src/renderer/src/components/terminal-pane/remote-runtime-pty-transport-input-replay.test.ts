@@ -13,6 +13,7 @@ import { REMOTE_RUNTIME_AUTO_RECOVERY_TIMEOUT_MS } from './remote-runtime-pty-re
 import { runTerminalPasteOperationWithTimeout } from './terminal-paste-operation-timeout'
 import { writeTerminalPastePtyInput } from './terminal-pty-paste-writer'
 import { TERMINAL_REMOTE_PASTE_OPERATION_TIMEOUT_MS } from './terminal-paste-limits'
+import { REMOTE_RUNTIME_INPUT_RESEND_DELAYS_MS } from './remote-runtime-input-resend-scheduler'
 
 let subscriptionCallbacks: MultiplexSubscriptionCallbacks = null
 let resolvedPaneHandle = 'terminal-1'
@@ -76,6 +77,8 @@ function attachStream(
   emitSnapshot(streamId, 'prompt$ ')
 }
 
+const RESEND_REQUEST = Uint8Array.of(2)
+
 function emitInputAck(streamId: number, seq: number, payload = new Uint8Array()): void {
   subscriptionCallbacks?.onBinary?.(
     encodeTerminalStreamFrame({
@@ -109,14 +112,17 @@ function pasteChunk(transport: Parameters<typeof writeTerminalPastePtyInput>[0],
   )
 }
 
-async function connectPane(capabilities: Record<string, 1>) {
+async function connectPane(
+  capabilities: Record<string, 1>,
+  callbacks: { onWriteUnavailable?: () => void } = {}
+) {
   const { createRemoteRuntimePtyTransport } = await import('./remote-runtime-pty-transport')
   const transport = createRemoteRuntimePtyTransport('env-1', {
     worktreeId: 'wt-1',
     tabId: 'tab-1',
     leafId: 'pane:1'
   })
-  transport.attach({ existingPtyId: 'remote:terminal-1', cols: 80, rows: 24, callbacks: {} })
+  transport.attach({ existingPtyId: 'remote:terminal-1', cols: 80, rows: 24, callbacks })
   await vi.waitFor(() => expect(subscribeFrameCount()).toBe(1))
   const streamId = latestSubscribePayload().streamId
   attachStream(streamId, capabilities)
@@ -368,7 +374,81 @@ describe('remote pane input across a silent outage', () => {
       attachStream(latestSubscribePayload().streamId, { inputAck: 1 })
       await vi.advanceTimersByTimeAsync(50)
 
-      expect(sentInputs(reattach).map((input) => input.text)).toEqual(['ls\r'])
+      // The given-up chunk's slot is filled empty so the host, which writes in order, can go on.
+      expect(sentInputs(reattach).map((input) => input.text)).toEqual(['', 'ls\r'])
+      transport.destroy?.()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('keeps typing batched just before a paste when that paste is given up', async () => {
+    vi.useFakeTimers()
+    try {
+      const { transport } = await connectPane({ inputAck: 1 })
+      // Typed and pasted inside one input debounce, while the link silently stops delivering.
+      transport.sendInput('echo retained ', 'driving')
+      const paste = pasteChunk(transport, '\x1b[200~rm -rf build\r')
+      await vi.advanceTimersByTimeAsync(20)
+      await vi.advanceTimersByTimeAsync(TERMINAL_REMOTE_PASTE_OPERATION_TIMEOUT_MS + 1_000)
+      await expect(paste).resolves.toEqual({ timedOut: true })
+      expect(subscribeFrameCount()).toBeGreaterThan(1)
+
+      const reattach = subscribeFrameCount()
+      attachStream(latestSubscribePayload().streamId, { inputAck: 1 })
+      await vi.advanceTimersByTimeAsync(50)
+
+      expect(sentInputs(reattach).map((input) => input.text)).toEqual(['echo retained ', ''])
+      transport.destroy?.()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('resends input the host refused on the same live stream, without remounting, and keeps later typing flowing', async () => {
+    const onWriteUnavailable = vi.fn()
+    const { transport, streamId } = await connectPane({ inputAck: 1 }, { onWriteUnavailable })
+    transport.sendInput('a', 'driving')
+    await vi.waitFor(() => expect(sentInputs()).toHaveLength(1))
+    emitInputAck(streamId, 1)
+    transport.sendInput('b', 'driving')
+    await vi.waitFor(() => expect(sentInputs()).toHaveLength(2))
+    transport.sendInput('c', 'driving')
+    await vi.waitFor(() => expect(sentInputs()).toHaveLength(3))
+
+    // The host's PTY briefly refused seq 2 and wrote nothing after it.
+    emitInputAck(streamId, 2, RESEND_REQUEST)
+    emitInputAck(streamId, 2, RESEND_REQUEST)
+    await vi.waitFor(() => expect(sentInputs()).toHaveLength(5))
+    expect(sentInputs().slice(3)).toEqual([
+      { seq: 2, text: 'b' },
+      { seq: 3, text: 'c' }
+    ])
+    emitInputAck(streamId, 3)
+    transport.sendInput('d', 'driving')
+    await vi.waitFor(() => expect(sentInputs().at(-1)).toEqual({ seq: 4, text: 'd' }))
+    expect(subscribeFrameCount()).toBe(1)
+    expect(onWriteUnavailable).not.toHaveBeenCalled()
+    transport.destroy?.()
+  })
+
+  it('remounts only once the host has refused every resend', async () => {
+    vi.useFakeTimers()
+    try {
+      const onWriteUnavailable = vi.fn()
+      const { transport, streamId } = await connectPane({ inputAck: 1 }, { onWriteUnavailable })
+      transport.sendInput('a', 'driving')
+      await vi.advanceTimersByTimeAsync(20)
+      for (const delay of REMOTE_RUNTIME_INPUT_RESEND_DELAYS_MS) {
+        emitInputAck(streamId, 1, RESEND_REQUEST)
+        await vi.advanceTimersByTimeAsync(delay)
+      }
+      expect(onWriteUnavailable).not.toHaveBeenCalled()
+      expect(sentInputs().filter((input) => input.text === 'a')).toHaveLength(
+        REMOTE_RUNTIME_INPUT_RESEND_DELAYS_MS.length + 1
+      )
+      emitInputAck(streamId, 1, RESEND_REQUEST)
+      expect(onWriteUnavailable).toHaveBeenCalledTimes(1)
       transport.destroy?.()
     } finally {
       vi.useRealTimers()

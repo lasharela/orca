@@ -38,15 +38,25 @@ export enum TerminalStreamOpcode {
 }
 
 const INPUT_ACK_DELIVERY_UNKNOWN = 1
+const INPUT_ACK_RESEND = 2
 
 /** InputAck payload for a write that failed after it may have written; the client must not replay it. */
 export function encodeTerminalInputAckDeliveryUnknown(): Uint8Array {
   return Uint8Array.of(INPUT_ACK_DELIVERY_UNKNOWN)
 }
 
+/** InputAck payload that acks nothing: `seq` is the oldest input the host needs sent again. */
+export function encodeTerminalInputAckResend(): Uint8Array {
+  return Uint8Array.of(INPUT_ACK_RESEND)
+}
+
 /** An empty InputAck payload means the host applied the input. */
 export function isTerminalInputAckDeliveryUnknown(payload: Uint8Array): boolean {
   return payload[0] === INPUT_ACK_DELIVERY_UNKNOWN
+}
+
+export function isTerminalInputAckResend(payload: Uint8Array): boolean {
+  return payload[0] === INPUT_ACK_RESEND
 }
 
 export type TerminalStreamFrame = {

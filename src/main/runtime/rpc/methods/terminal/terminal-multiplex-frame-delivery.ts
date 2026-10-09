@@ -1,6 +1,7 @@
 import {
   TerminalStreamOpcode,
   encodeTerminalInputAckDeliveryUnknown,
+  encodeTerminalInputAckResend,
   encodeTerminalStreamFrame,
   encodeTerminalStreamJson,
   encodeTerminalStreamText
@@ -71,7 +72,7 @@ export function installMultiplexFrameDelivery(
   state.sendInputAck = (
     stream: TerminalMultiplexStream,
     inputSeq: number,
-    deliveryUnknown: boolean
+    settlement: 'applied' | 'delivery-unknown' | 'resend'
   ): void => {
     // Why: a detached stream's client already replays on its successor, which acks again.
     if (state.closed || streams.get(stream.streamId) !== stream || stream.inputSessionId === null) {
@@ -80,7 +81,11 @@ export function installMultiplexFrameDelivery(
     state.sendFrame(
       stream.streamId,
       TerminalStreamOpcode.InputAck,
-      deliveryUnknown ? encodeTerminalInputAckDeliveryUnknown() : undefined,
+      settlement === 'delivery-unknown'
+        ? encodeTerminalInputAckDeliveryUnknown()
+        : settlement === 'resend'
+          ? encodeTerminalInputAckResend()
+          : undefined,
       inputSeq
     )
   }

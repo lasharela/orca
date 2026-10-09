@@ -9,20 +9,25 @@ const DELIVERY_UNKNOWN_SEQS_PER_SESSION = 64
 /** What one write did: `refused` wrote nothing, `delivery-unknown` threw after it may have. */
 export type TerminalInputWriteOutcome = 'applied' | 'refused' | 'delivery-unknown'
 
-/** What the client is told: `unacked` sends nothing, so the client keeps the input to replay. */
-export type TerminalInputAdmission = 'applied' | 'delivery-unknown' | 'unacked'
+/**
+ * What the client is told. `resend` acks nothing: the session needs every input from `fromSeq`
+ * again, in order, before it writes anything newer.
+ */
+export type TerminalInputAdmission =
+  | { kind: 'applied' }
+  | { kind: 'delivery-unknown' }
+  | { kind: 'resend'; fromSeq: number }
 
-/** The multiplex stream that brought an input frame; the ledger uses only its identity. */
-export type TerminalInputCarrier = { readonly streamId: number }
+const APPLIED: TerminalInputAdmission = { kind: 'applied' }
+const DELIVERY_UNKNOWN: TerminalInputAdmission = { kind: 'delivery-unknown' }
 
 type SessionEntry = {
+  // Highest sequence admitted; every sequence at or below it is written or queued to be.
   appliedSeq: number
   // Bumped when a refused write revokes the admissions queued behind it.
   epoch: number
   writeTail: Promise<void>
   deliveryUnknownSeqs: number[]
-  // Set after a refusal: later input from carriers that predate it would land ahead of the gap.
-  blocked: { seq: number; lastCarrier: number } | null
 }
 
 /**
@@ -35,59 +40,52 @@ export class TerminalInputSequenceLedger {
   // clients drop input of unknown delivery instead of replaying it into a ledger that forgot it.
   readonly id = randomUUID()
   private readonly sessions = new Map<string, SessionEntry>()
-  private readonly carrierOrder = new WeakMap<TerminalInputCarrier, number>()
-  private carrierCount = 0
 
   /**
    * Records `seq` and runs `write` after every earlier admitted write of the session, whichever
-   * `carrier` (connection stream) brought it. Only applied input advances the session: a refused
-   * write is rolled back so its replay writes it, and nothing queued behind it runs or is acked.
-   * `duplicate` is set when `seq` was already admitted; `settled` then reports the original write.
+   * connection brought it. A session admits only the next sequence: a gap (a refused write rolled
+   * back, or a stale frame from a dead connection racing the replay) is answered with `resend`, so
+   * nothing is ever written ahead of earlier input. `duplicate` is set when `seq` was already
+   * admitted; `settled` then reports the original write.
    */
   admit(
     ptyId: string,
     inputSessionId: string,
     seq: number,
-    carrier: TerminalInputCarrier,
     write: () => Promise<TerminalInputWriteOutcome>
   ): { duplicate: boolean; settled: Promise<TerminalInputAdmission> } {
     const key = `${ptyId}\u0000${inputSessionId}`
+    // Why a new session starts at any sequence: the client numbers input per pane, not per PTY.
     const entry = this.sessions.get(key) ?? {
-      appliedSeq: 0,
+      appliedSeq: seq - 1,
       epoch: 0,
       writeTail: Promise.resolve(),
-      deliveryUnknownSeqs: [],
-      blocked: null
+      deliveryUnknownSeqs: []
     }
     this.sessions.delete(key)
     this.sessions.set(key, entry)
     this.evictOverflow()
-    const carrierOrder = this.orderOf(carrier)
-    if (entry.blocked) {
-      // Why a newer carrier lifts it: the client replays from its oldest unacked input there.
-      if (seq !== entry.blocked.seq && carrierOrder <= entry.blocked.lastCarrier) {
-        return { duplicate: false, settled: Promise.resolve('unacked') }
-      }
-      entry.blocked = null
-    }
     if (seq <= entry.appliedSeq) {
       return {
         duplicate: true,
         settled: entry.writeTail.then(() => admissionOf(entry, seq))
       }
     }
+    if (seq > entry.appliedSeq + 1) {
+      return { duplicate: false, settled: Promise.resolve(resendFrom(entry)) }
+    }
     entry.appliedSeq = seq
     const epoch = entry.epoch
     const run = entry.writeTail.then(async (): Promise<TerminalInputAdmission> => {
       if (entry.epoch !== epoch) {
-        return 'unacked'
+        return resendFrom(entry)
       }
       const outcome = await write().catch((): TerminalInputWriteOutcome => 'delivery-unknown')
       if (outcome === 'refused') {
+        // Why roll back: the client keeps refused input, and its resend must be written, not deduped.
         entry.epoch += 1
         entry.appliedSeq = seq - 1
-        entry.blocked = { seq, lastCarrier: this.carrierCount }
-        return 'unacked'
+        return resendFrom(entry)
       }
       if (outcome === 'delivery-unknown') {
         entry.deliveryUnknownSeqs.push(seq)
@@ -95,21 +93,12 @@ export class TerminalInputSequenceLedger {
           0,
           entry.deliveryUnknownSeqs.length - DELIVERY_UNKNOWN_SEQS_PER_SESSION
         )
+        return DELIVERY_UNKNOWN
       }
-      return outcome
+      return APPLIED
     })
     entry.writeTail = run.then(() => undefined)
     return { duplicate: false, settled: run }
-  }
-
-  private orderOf(carrier: TerminalInputCarrier): number {
-    let order = this.carrierOrder.get(carrier)
-    if (order === undefined) {
-      this.carrierCount += 1
-      order = this.carrierCount
-      this.carrierOrder.set(carrier, order)
-    }
-    return order
   }
 
   private evictOverflow(): void {
@@ -123,11 +112,15 @@ export class TerminalInputSequenceLedger {
   }
 }
 
+function resendFrom(entry: SessionEntry): TerminalInputAdmission {
+  return { kind: 'resend', fromSeq: entry.appliedSeq + 1 }
+}
+
 function admissionOf(entry: SessionEntry, seq: number): TerminalInputAdmission {
   if (seq > entry.appliedSeq) {
-    return 'unacked'
+    return resendFrom(entry)
   }
-  return entry.deliveryUnknownSeqs.includes(seq) ? 'delivery-unknown' : 'applied'
+  return entry.deliveryUnknownSeqs.includes(seq) ? DELIVERY_UNKNOWN : APPLIED
 }
 
 const ledgers = new WeakMap<OrcaRuntimeService, TerminalInputSequenceLedger>()

@@ -20,7 +20,10 @@ export function handleMultiplexInputFrame(
   const text = decodeTerminalStreamText(frame.payload)
   // Mobile already has the higher-priority floor, so a rejected desktop claim must not suppress later phone input.
   const inputClaimTail = stream.isMobile ? Promise.resolve(true) : stream.desktopClaimTail
+  const inputSessionId = frame.seq > 0 ? stream.inputSessionId : null
+  const sequenced = inputSessionId !== null
   // Why 'applied' for locked or unclaimed input: it is dropped by policy, and a replay must not run it later.
+  // Empty sequenced input is how a client fills the slot of input it gave up, so later input can follow.
   const deliver = async (): Promise<TerminalInputWriteOutcome> => {
     if (!text || isTerminalInputLockedForClient(runtime, stream.ptyId, stream.client)) {
       return 'applied'
@@ -33,31 +36,30 @@ export function handleMultiplexInputFrame(
       terminal: stream.terminal,
       text,
       client: stream.client,
-      isMobile: stream.isMobile
+      isMobile: stream.isMobile,
+      // Why: an ack drops the client's replay copy, so it must wait for the provider's handoff.
+      requireWriteSettlement: sequenced
     })
-    state.notifyStreamWriteUnavailable(stream, outcome)
+    if (!sequenced) {
+      state.notifyStreamWriteUnavailable(stream, outcome)
+    }
     return outcome === 'delivered'
       ? 'applied'
       : outcome === 'rejected'
         ? 'refused'
         : 'delivery-unknown'
   }
-  if (stream.inputSessionId === null || frame.seq <= 0) {
+  if (inputSessionId === null) {
     void deliver()
     return
   }
   const inputSeq = frame.seq
-  const { settled } = inputSequenceLedger.admit(
-    stream.ptyId,
-    stream.inputSessionId,
-    inputSeq,
-    stream,
-    deliver
-  )
+  const { settled } = inputSequenceLedger.admit(stream.ptyId, inputSessionId, inputSeq, deliver)
   // Why ack a duplicate too: the client replays until acked, and the first copy's ack may have died with its connection.
-  void settled.then((admission) => {
-    if (admission !== 'unacked') {
-      state.sendInputAck(stream, inputSeq, admission === 'delivery-unknown')
-    }
-  })
+  // Why resend instead of WriteUnavailable: the client keeps its journal and resends on this stream; a remount would discard it.
+  void settled.then((admission) =>
+    admission.kind === 'resend'
+      ? state.sendInputAck(stream, admission.fromSeq, 'resend')
+      : state.sendInputAck(stream, inputSeq, admission.kind)
+  )
 }

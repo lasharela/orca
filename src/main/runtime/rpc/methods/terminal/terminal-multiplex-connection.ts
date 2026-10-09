@@ -50,10 +50,11 @@ export type TerminalMultiplexFrameDelivery = {
     stream: TerminalMultiplexStream,
     outcome: 'delivered' | 'rejected' | 'failed'
   ) => void
+  /** Settles sequenced input on its stream; `resend` acks nothing and asks for input from `inputSeq` again. */
   sendInputAck: (
     stream: TerminalMultiplexStream,
     inputSeq: number,
-    deliveryUnknown: boolean
+    settlement: 'applied' | 'delivery-unknown' | 'resend'
   ) => void
   sendResizedFrame: (
     stream: TerminalMultiplexStream,

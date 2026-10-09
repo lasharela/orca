@@ -11,18 +11,20 @@ import {
   encodeTerminalStreamFrame,
   encodeTerminalStreamJson,
   encodeTerminalStreamText,
-  isTerminalInputAckDeliveryUnknown
+  isTerminalInputAckDeliveryUnknown,
+  isTerminalInputAckResend
 } from '../../../shared/terminal-stream-protocol'
 import { makeRequest, stubRuntime } from './terminal-multiplex-test-harness'
 
 type FrameHandler = (frame: NonNullable<ReturnType<typeof decodeTerminalStreamFrame>>) => void
 
-type ScriptedWrite = 'accept' | 'reject' | 'throw'
+type ScriptedWrite = 'accept' | 'reject' | 'throw' | 'unverifiable'
 
 function createRuntime(
   writes: string[],
   writeGate: () => Promise<void> = async () => {},
-  scriptedWrites: ScriptedWrite[] = []
+  scriptedWrites: ScriptedWrite[] = [],
+  sendOptions: unknown[] = []
 ): OrcaRuntimeService {
   const registry = createSubscriptionRegistryDouble()
   return stubRuntime({
@@ -44,9 +46,23 @@ function createRuntime(
     cleanupSubscriptionsForConnection: vi.fn(registry.cleanupSubscriptionsForConnection),
     waitForTerminal: vi.fn(() => new Promise<RuntimeTerminalWait>(() => {})),
     updateDesktopViewport: vi.fn().mockResolvedValue(true),
-    sendTerminal: vi.fn(async (_handle: string, action: { text?: string }) => {
+    sendTerminal: vi.fn(async (_handle: string, action: { text?: string }, options: unknown) => {
+      sendOptions.push(options)
       await writeGate()
       const scripted = scriptedWrites.shift() ?? 'accept'
+      if (scripted === 'unverifiable') {
+        // The SSH provider queued the bytes, then its connection dropped before the handoff settled.
+        return {
+          handle: 'terminal-1',
+          accepted: false,
+          bytesWritten: 0,
+          writeSettlement: {
+            outcome: 'unverifiable' as const,
+            reason: 'transport_settlement_lost' as const,
+            bytesHandedToTransport: true
+          }
+        }
+      }
       if (scripted === 'throw') {
         throw new Error('ssh channel write failed')
       }
@@ -120,7 +136,20 @@ async function openConnection(
     inputAcks: () =>
       binaryFrames
         .map((bytes) => decodeTerminalStreamFrame(bytes))
-        .filter((frame) => frame?.opcode === TerminalStreamOpcode.InputAck)
+        .filter(
+          (frame) =>
+            frame?.opcode === TerminalStreamOpcode.InputAck &&
+            !isTerminalInputAckResend(frame.payload)
+        )
+        .map((frame) => frame!.seq),
+    resendRequests: () =>
+      binaryFrames
+        .map((bytes) => decodeTerminalStreamFrame(bytes))
+        .filter(
+          (frame) =>
+            frame?.opcode === TerminalStreamOpcode.InputAck &&
+            isTerminalInputAckResend(frame.payload)
+        )
         .map((frame) => frame!.seq),
     deliveryUnknownAcks: () =>
       binaryFrames
@@ -168,7 +197,7 @@ describe('terminal multiplex sequenced input across reconnects', () => {
     expect(writes).toEqual(['PZ600-0', '12', '3\r'])
   })
 
-  it('never acks a write the PTY refused, and writes it once the client replays it', async () => {
+  it('never acks a write the PTY refused, and asks the same stream to resend instead of remounting', async () => {
     const writes: string[] = []
     const dispatcher = new RpcDispatcher({
       runtime: createRuntime(writes, async () => {}, ['accept', 'reject']),
@@ -178,21 +207,40 @@ describe('terminal multiplex sequenced input across reconnects', () => {
       capabilities: { writeUnavailable: 1 as const, inputAck: 1 as const },
       inputSessionId: 'pane-a'
     }
-    const first = await openConnection(dispatcher, 'conn-first', subscribe)
-    first.sendInput(1, 'echo a\r')
-    first.sendInput(2, 'echo b\r')
-    first.sendInput(3, 'echo c\r')
-    await vi.waitFor(() => expect(first.writeUnavailableCount()).toBe(1))
-    await new Promise((resolve) => setTimeout(resolve, 20))
+    const stream = await openConnection(dispatcher, 'conn-first', subscribe)
+    stream.sendInput(1, 'echo a\r')
+    stream.sendInput(2, 'echo b\r')
+    stream.sendInput(3, 'echo c\r')
+    await vi.waitFor(() => expect(stream.resendRequests()).toEqual([2, 2]))
     // Neither the refused seq 2 nor seq 3 behind it may be acked, or the client drops them.
-    expect(first.inputAcks()).toEqual([1])
+    expect(stream.inputAcks()).toEqual([1])
     expect(writes).toEqual(['echo a\r'])
+    // A remount would throw away the client's journal, so a sequenced refusal must not ask for one.
+    expect(stream.writeUnavailableCount()).toBe(0)
 
-    const replacement = await openConnection(dispatcher, 'conn-replacement', subscribe)
-    replacement.sendInput(2, 'echo b\r')
-    replacement.sendInput(3, 'echo c\r')
-    await vi.waitFor(() => expect(replacement.inputAcks()).toEqual([2, 3]))
-    expect(writes).toEqual(['echo a\r', 'echo b\r', 'echo c\r'])
+    // The PTY is writable again: the live stream resends, and typing after it keeps flowing.
+    stream.sendInput(2, 'echo b\r')
+    stream.sendInput(3, 'echo c\r')
+    stream.sendInput(4, 'echo d\r')
+    await vi.waitFor(() => expect(stream.inputAcks()).toEqual([1, 2, 3, 4]))
+    expect(writes).toEqual(['echo a\r', 'echo b\r', 'echo c\r', 'echo d\r'])
+  })
+
+  it('acks sequenced input only once the provider settles its handoff', async () => {
+    const writes: string[] = []
+    const sendOptions: unknown[] = []
+    const dispatcher = new RpcDispatcher({
+      runtime: createRuntime(writes, async () => {}, ['unverifiable'], sendOptions),
+      methods: TERMINAL_METHODS
+    })
+    const subscribe = { capabilities: { inputAck: 1 as const }, inputSessionId: 'pane-a' }
+    const connection = await openConnection(dispatcher, 'conn-1', subscribe)
+    connection.sendInput(1, 'make deploy\r')
+    await vi.waitFor(() => expect(connection.inputAcks()).toEqual([1]))
+    expect(sendOptions[0]).toMatchObject({ requireWriteSettlement: true })
+    // Unknown, not refused: a resend could run the command twice.
+    expect(connection.deliveryUnknownAcks()).toEqual([1])
+    expect(connection.resendRequests()).toEqual([])
   })
 
   it('tells the client a thrown write has unknown delivery instead of acking it as applied', async () => {

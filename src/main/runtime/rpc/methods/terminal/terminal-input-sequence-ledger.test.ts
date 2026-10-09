@@ -5,10 +5,22 @@ import {
   type TerminalInputWriteOutcome
 } from './terminal-input-sequence-ledger'
 
-let carriers = 0
-const newCarrier = () => ({ streamId: ++carriers })
-const carrier = newCarrier()
 const applied = async (): Promise<TerminalInputWriteOutcome> => 'applied'
+const APPLIED = { kind: 'applied' }
+const resend = (fromSeq: number) => ({ kind: 'resend', fromSeq })
+
+function recordingWrites() {
+  const writes: string[] = []
+  const write =
+    (text: string, outcome: TerminalInputWriteOutcome = 'applied') =>
+    async (): Promise<TerminalInputWriteOutcome> => {
+      if (outcome === 'applied') {
+        writes.push(text)
+      }
+      return outcome
+    }
+  return { writes, write }
+}
 
 describe('TerminalInputSequenceLedger', () => {
   it('runs admitted writes of one session in sequence order, even when an earlier write is slow', async () => {
@@ -19,7 +31,6 @@ describe('TerminalInputSequenceLedger', () => {
       'pty-1',
       'session',
       1,
-      carrier,
       () =>
         new Promise<TerminalInputWriteOutcome>((resolve) => {
           releaseFirst = () => {
@@ -28,85 +39,120 @@ describe('TerminalInputSequenceLedger', () => {
           }
         })
     )
-    const { settled: second } = ledger.admit('pty-1', 'session', 2, carrier, async () => {
+    const { settled: second } = ledger.admit('pty-1', 'session', 2, async () => {
       writes.push('b')
       return 'applied'
     })
     await Promise.resolve()
     expect(writes).toEqual([])
     releaseFirst()
-    await expect(Promise.all([first, second])).resolves.toEqual(['applied', 'applied'])
+    await expect(Promise.all([first, second])).resolves.toEqual([APPLIED, APPLIED])
     expect(writes).toEqual(['a', 'b'])
   })
 
   it('reports a thrown write as delivery-unknown, including to its replay', async () => {
     const ledger = new TerminalInputSequenceLedger()
     await expect(
-      ledger.admit('pty-1', 'session', 1, carrier, async () => {
+      ledger.admit('pty-1', 'session', 1, async () => {
         throw new Error('write failed')
       }).settled
-    ).resolves.toBe('delivery-unknown')
-    const replay = ledger.admit('pty-1', 'session', 1, newCarrier(), applied)
+    ).resolves.toEqual({ kind: 'delivery-unknown' })
+    const replay = ledger.admit('pty-1', 'session', 1, applied)
     expect(replay.duplicate).toBe(true)
-    await expect(replay.settled).resolves.toBe('delivery-unknown')
-    expect(ledger.admit('pty-1', 'session', 2, carrier, applied).duplicate).toBe(false)
+    await expect(replay.settled).resolves.toEqual({ kind: 'delivery-unknown' })
+    expect(ledger.admit('pty-1', 'session', 2, applied).duplicate).toBe(false)
   })
 
-  it('never acks a refused write, and writes it when the client replays it', async () => {
+  it('never acks a refused write, asks for it again, and writes it when resent', async () => {
     const ledger = new TerminalInputSequenceLedger()
-    const writes: string[] = []
-    const write =
-      (text: string, outcome: TerminalInputWriteOutcome = 'applied') =>
-      async (): Promise<TerminalInputWriteOutcome> => {
-        if (outcome === 'applied') {
-          writes.push(text)
-        }
-        return outcome
-      }
-    const dead = newCarrier()
-    await ledger.admit('pty-1', 'session', 1, dead, write('a')).settled
+    const { writes, write } = recordingWrites()
+    await ledger.admit('pty-1', 'session', 1, write('a')).settled
     // The SSH provider is reconnecting, so the PTY refuses seq 2; seq 3 is already queued behind it.
-    const refused = ledger.admit('pty-1', 'session', 2, dead, write('b', 'refused'))
-    const queued = ledger.admit('pty-1', 'session', 3, dead, write('c'))
-    await expect(refused.settled).resolves.toBe('unacked')
-    await expect(queued.settled).resolves.toBe('unacked')
+    const refused = ledger.admit('pty-1', 'session', 2, write('b', 'refused'))
+    const queued = ledger.admit('pty-1', 'session', 3, write('c'))
+    await expect(refused.settled).resolves.toEqual(resend(2))
+    await expect(queued.settled).resolves.toEqual(resend(2))
     // Typed on the same stream after the refusal: running it would skip the refused bytes.
-    await expect(ledger.admit('pty-1', 'session', 4, dead, write('d')).settled).resolves.toBe(
-      'unacked'
+    await expect(ledger.admit('pty-1', 'session', 4, write('d')).settled).resolves.toEqual(
+      resend(2)
     )
     expect(writes).toEqual(['a'])
 
-    const replacement = newCarrier()
-    const replay = [2, 3, 4].map(
-      (seq) => ledger.admit('pty-1', 'session', seq, replacement, write('bcd'[seq - 2])).settled
+    // The same live stream resends from seq 2, and input typed after the resend keeps flowing.
+    const resent = [2, 3, 4, 5].map(
+      (seq) => ledger.admit('pty-1', 'session', seq, write('bcde'[seq - 2])).settled
     )
-    await expect(Promise.all(replay)).resolves.toEqual(['applied', 'applied', 'applied'])
-    expect(writes).toEqual(['a', 'b', 'c', 'd'])
+    await expect(Promise.all(resent)).resolves.toEqual([APPLIED, APPLIED, APPLIED, APPLIED])
+    expect(writes).toEqual(['a', 'b', 'c', 'd', 'e'])
   })
 
-  it('lets a new stream resume past a refused write the client chose not to replay', async () => {
+  it('asks a replacement stream whose replay raced the refusal to resend, instead of dropping its input', async () => {
     const ledger = new TerminalInputSequenceLedger()
-    await ledger.admit('pty-1', 'session', 1, carrier, async () => 'refused').settled
-    // Seq 1 was a terminal query reply, which clients never replay.
-    await expect(ledger.admit('pty-1', 'session', 2, newCarrier(), applied).settled).resolves.toBe(
-      'applied'
+    const { writes, write } = recordingWrites()
+    let releaseFirst = (): void => {}
+    // Old stream: seq 1 is a slow paste chunk, seq 2 queued behind it.
+    ledger.admit(
+      'pty-1',
+      'session',
+      1,
+      () =>
+        new Promise<TerminalInputWriteOutcome>((resolve) => {
+          releaseFirst = () => {
+            writes.push('1')
+            resolve('applied')
+          }
+        })
     )
+    ledger.admit('pty-1', 'session', 2, write('2', 'refused'))
+    // Replacement stream replays 1 and 2 (both duplicates by now), then types seq 3.
+    const replay = [1, 2].map((seq) => ledger.admit('pty-1', 'session', seq, write('dup')).settled)
+    const typed = ledger.admit('pty-1', 'session', 3, write('3')).settled
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    releaseFirst()
+    await expect(Promise.all([...replay, typed])).resolves.toEqual([APPLIED, resend(2), resend(2)])
+
+    const resent = [2, 3, 4].map(
+      (seq) => ledger.admit('pty-1', 'session', seq, write(String(seq))).settled
+    )
+    await expect(Promise.all(resent)).resolves.toEqual([APPLIED, APPLIED, APPLIED])
+    expect(writes).toEqual(['1', '2', '3', '4'])
+  })
+
+  it('never writes a dead stream frame that arrives after a gap ahead of the resend that fills it', async () => {
+    const ledger = new TerminalInputSequenceLedger()
+    const { writes, write } = recordingWrites()
+    await ledger.admit('pty-1', 'session', 1, write('a', 'refused')).settled
+    // The dead stream's later frame races the replacement's resend of seq 1.
+    await expect(ledger.admit('pty-1', 'session', 3, write('c')).settled).resolves.toEqual(
+      resend(1)
+    )
+    const resent = [1, 2, 3].map(
+      (seq) => ledger.admit('pty-1', 'session', seq, write('abc'[seq - 1])).settled
+    )
+    await expect(Promise.all(resent)).resolves.toEqual([APPLIED, APPLIED, APPLIED])
+    expect(writes).toEqual(['a', 'b', 'c'])
+  })
+
+  it('starts a new session at whatever sequence the client is up to', async () => {
+    const ledger = new TerminalInputSequenceLedger()
+    await expect(ledger.admit('pty-1', 'session', 40, applied).settled).resolves.toEqual(APPLIED)
+    await expect(ledger.admit('pty-1', 'session', 41, applied).settled).resolves.toEqual(APPLIED)
   })
 
   it('scopes sequences by PTY so a session reused on another terminal is not deduped', () => {
     const ledger = new TerminalInputSequenceLedger()
-    expect(ledger.admit('pty-1', 'session', 5, carrier, applied).duplicate).toBe(false)
-    expect(ledger.admit('pty-2', 'session', 5, carrier, applied).duplicate).toBe(false)
+    expect(ledger.admit('pty-1', 'session', 5, applied).duplicate).toBe(false)
+    expect(ledger.admit('pty-2', 'session', 5, applied).duplicate).toBe(false)
   })
 
   it('evicts the least recently used session past its bound', () => {
     const ledger = new TerminalInputSequenceLedger()
-    ledger.admit('pty-1', 'oldest', 1, carrier, applied)
+    ledger.admit('pty-1', 'oldest', 1, applied)
     for (let index = 0; index < TERMINAL_INPUT_SEQUENCE_LEDGER_MAX_SESSIONS; index += 1) {
-      ledger.admit('pty-1', `session-${index}`, 1, carrier, applied)
+      ledger.admit('pty-1', `session-${index}`, 1, applied)
     }
-    expect(ledger.admit('pty-1', 'session-0', 1, carrier, applied).duplicate).toBe(true)
-    expect(ledger.admit('pty-1', 'oldest', 1, carrier, applied).duplicate).toBe(false)
+    expect(ledger.admit('pty-1', 'session-0', 1, applied).duplicate).toBe(true)
+    expect(ledger.admit('pty-1', 'oldest', 1, applied).duplicate).toBe(false)
   })
 
   it('settles a duplicate only after the original write it repeats', async () => {
@@ -116,14 +162,13 @@ describe('TerminalInputSequenceLedger', () => {
       'pty-1',
       'session',
       1,
-      carrier,
       () =>
         new Promise<TerminalInputWriteOutcome>((resolve) => {
           releaseFirst = () => resolve('applied')
         })
     )
     let duplicateSettled = false
-    const duplicate = ledger.admit('pty-1', 'session', 1, newCarrier(), applied)
+    const duplicate = ledger.admit('pty-1', 'session', 1, applied)
     expect(duplicate.duplicate).toBe(true)
     void duplicate.settled.then(() => {
       duplicateSettled = true
@@ -131,7 +176,7 @@ describe('TerminalInputSequenceLedger', () => {
     await new Promise((resolve) => setTimeout(resolve, 0))
     expect(duplicateSettled).toBe(false)
     releaseFirst()
-    await expect(duplicate.settled).resolves.toBe('applied')
+    await expect(duplicate.settled).resolves.toEqual(APPLIED)
     expect(duplicateSettled).toBe(true)
   })
 
