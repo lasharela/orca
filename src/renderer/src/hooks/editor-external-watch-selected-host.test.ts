@@ -11,7 +11,10 @@ type SelectedHostState = EditorExternalWatchTargetState &
   Pick<AppState, 'activeWorkspaceExecutionHostId'>
 
 const hosts = ['host-a', 'host-b'] as const
-function makeState(workspace: 'worktree' | 'folder'): SelectedHostState {
+function makeState(
+  workspace: 'worktree' | 'folder',
+  rootFor: (host: string) => string = () => (workspace === 'folder' ? '/folder' : '/repo')
+): SelectedHostState {
   const id = workspace === 'folder' ? 'folder:same-folder' : 'same-worktree'
   return {
     settings: getDefaultSettings('/home/me'),
@@ -23,7 +26,7 @@ function makeState(workspace: 'worktree' | 'folder'): SelectedHostState {
       workspace === 'worktree'
         ? {
             repo: hosts.map((host) =>
-              makeWorktree({ id, repoId: 'repo', path: '/repo', hostId: `runtime:${host}` })
+              makeWorktree({ id, repoId: 'repo', path: rootFor(host), hostId: `runtime:${host}` })
             )
           }
         : {},
@@ -32,7 +35,7 @@ function makeState(workspace: 'worktree' | 'folder'): SelectedHostState {
         ? hosts.map((host) =>
             makeFolderWorkspace({
               id: 'same-folder',
-              folderPath: '/folder',
+              folderPath: rootFor(host),
               executionHostId: `runtime:${host}`
             })
           )
@@ -70,3 +73,43 @@ it.each(['worktree', 'folder'] as const)(
     expect(selectEditorExternalWatchTargets({ ...state })).toBe(first)
   }
 )
+
+it.each(['worktree', 'folder'] as const)(
+  "watches the selected host's %s root when hosts publish the same id at different roots",
+  (workspace) => {
+    const state = makeState(workspace, (host) => `/${host}/repo`)
+    const onB = selectEditorExternalWatchTargets({
+      ...state,
+      activeWorkspaceExecutionHostId: 'runtime:host-b'
+    })
+    expect(onB.targets.map((target) => [target.runtimeEnvironmentId, target.worktreePath])).toEqual(
+      [['host-b', '/host-b/repo']]
+    )
+    const onA = selectEditorExternalWatchTargets(state)
+    expect(onA.targets.map((target) => [target.runtimeEnvironmentId, target.worktreePath])).toEqual(
+      [['host-a', '/host-a/repo']]
+    )
+  }
+)
+
+it('watches each open file owner at its own host root', () => {
+  const state = makeState('worktree', (host) => `/${host}/repo`)
+  const { targets } = selectEditorExternalWatchTargets({
+    ...state,
+    rightSidebarOpen: false,
+    openFiles: (['host-a', 'host-b'] as const).map((host) => ({
+      id: `${host}:a.ts`,
+      filePath: `/${host}/repo/a.ts`,
+      relativePath: 'a.ts',
+      worktreeId: 'same-worktree',
+      language: 'typescript',
+      isDirty: false,
+      mode: 'edit' as const,
+      runtimeEnvironmentId: host
+    }))
+  })
+  expect(targets.map((target) => [target.runtimeEnvironmentId, target.worktreePath])).toEqual([
+    ['host-a', '/host-a/repo'],
+    ['host-b', '/host-b/repo']
+  ])
+})

@@ -2,13 +2,12 @@ import type { AppState } from '@/store'
 import type { OpenFile } from '@/store/slices/editor'
 import { findWorktreeById } from '@/store/slices/worktree-helpers'
 import { findRepoForHost } from '@/store/slices/repo-host-identity'
-import { getFolderWorkspaceConnectionId } from '@/lib/folder-workspace-connection'
 import { isLocalWindowsDesktopClient } from '@/lib/desktop-window-chrome'
 import { getRuntimeEnvironmentIdForWorktree } from '@/lib/worktree-runtime-owner'
 import { isWindowsAbsolutePathLike } from '../../../shared/cross-platform-path'
 import { parseExecutionHostId } from '../../../shared/execution-host'
 import { isGitRepoKind } from '../../../shared/repo-kind'
-import { parseWorkspaceKey } from '../../../shared/workspace-scope'
+import { resolveEditorExternalWatchTargetRows } from './editor-external-watch-target-rows'
 
 export type EditorExternalWatchTarget = {
   worktreeId: string
@@ -186,43 +185,15 @@ export function selectEditorExternalWatchTargets(
   const parts: string[] = []
   const sortedWorktreeIds = Array.from(targetOwnersByWorktreeId.keys()).sort()
   for (const id of sortedWorktreeIds) {
-    const worktree = findWorktreeById(state.worktreesByRepo, id)
-    const workspaceScope = parseWorkspaceKey(id)
-    const folderWorkspace =
-      workspaceScope?.type === 'folder'
-        ? state.folderWorkspaces.find(
-            (workspace) => workspace.id === workspaceScope.folderWorkspaceId
-          )
-        : undefined
-    if (!worktree && !folderWorkspace) {
-      continue
-    }
-    const worktreeHost = parseExecutionHostId(worktree?.hostId)
-    const repo = worktree
-      ? worktreeHost?.kind === 'local'
-        ? (findRepoForHost(state.repos, worktree.repoId, { hostId: worktreeHost.id }) ?? undefined)
-        : state.repos.find((candidate) => candidate.id === worktree.repoId)
-      : undefined
-    const folderHostId = parseExecutionHostId(folderWorkspace?.executionHostId)?.id
-    const projectGroup = folderWorkspace
-      ? state.projectGroups.find(
-          (group) =>
-            group.id === folderWorkspace.projectGroupId &&
-            parseExecutionHostId(group.executionHostId)?.id === folderHostId
-        )
-      : undefined
-    const connectionId = folderWorkspace
-      ? getFolderWorkspaceConnectionId(state, folderWorkspace.id)
-      : repo
-        ? (repo.connectionId ?? null)
-        : undefined
-    if (connectionId === undefined && folderWorkspace) {
-      continue
-    }
     const owners = Array.from(targetOwnersByWorktreeId.get(id) ?? []).sort((left, right) =>
       (left ?? '').localeCompare(right ?? '')
     )
     for (const owner of owners) {
+      const rows = resolveEditorExternalWatchTargetRows(state, id, owner)
+      if (!rows || (rows.connectionId === undefined && rows.folderWorkspace)) {
+        continue
+      }
+      const { worktree, repo, folderWorkspace, projectGroup, connectionId } = rows
       const target = {
         worktreeId: id,
         worktreePath: worktree?.path ?? folderWorkspace!.folderPath,
