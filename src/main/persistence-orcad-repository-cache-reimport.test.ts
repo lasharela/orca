@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { githubAvatarIcon } from '../shared/repo-icon'
 import { manifest, REPOSITORY } from './persistence-orcad-migration-catalog-fixture'
 import { closeTestStores, createStore, testState } from './persistence-test-harness'
 
@@ -78,4 +79,47 @@ describe('reimporting a repository after the destination resolves its Git identi
       expect(store.getOrcadMigrationCatalogState(next).state).toBe('absent')
     }
   )
+  it('keeps the destination identity and automatic avatar after the remote is renamed', () => {
+    const oldIcon = githubAvatarIcon({ owner: 'old', repo: 'project' })
+    const newIcon = githubAvatarIcon({ owner: 'example', repo: 'project' })
+    const source = {
+      ...REPOSITORY,
+      repoIcon: oldIcon,
+      gitRemoteIdentity: { ...remoteIdentity, canonicalKey: 'github.com/old/project' }
+    }
+    const withSource = (migrationId: string) =>
+      manifest({ migrationId, payload: { ...manifest().payload, repositories: [source] } })
+    const store = createStore()
+    commit(store, withSource('m1'))
+    store.updateRepo(REPOSITORY.id, { gitRemoteIdentity: remoteIdentity, repoIcon: newIcon })
+
+    expect(commit(store, withSource('m2'))).toMatchObject({ state: 'committed' })
+    expect(store.getRepos()[0]).toMatchObject({
+      gitRemoteIdentity: remoteIdentity,
+      repoIcon: newIcon
+    })
+  })
+
+  it('still refuses a changed icon the user chose', () => {
+    const store = createStore()
+    commit(store, manifest())
+    store.updateRepo(REPOSITORY.id, {
+      repoIcon: githubAvatarIcon({ owner: 'example', repo: 'project' })
+    })
+    const next = manifest({
+      migrationId: 'migration-user-icon',
+      payload: {
+        ...manifest().payload,
+        repositories: [
+          {
+            ...REPOSITORY,
+            repoIcon: { type: 'image', src: 'data:image/png;base64,AA==', source: 'upload' }
+          }
+        ]
+      }
+    })
+    expect(() => commit(store, next)).toThrow(
+      `orcad_migration_repository_id_conflict:${REPOSITORY.id}`
+    )
+  })
 })

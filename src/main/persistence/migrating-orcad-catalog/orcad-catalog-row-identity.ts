@@ -22,13 +22,22 @@ export function selectNewRows<T extends { id: string }>(
   })
 }
 
+function isAutomaticGitHubIcon(repo: Repo): boolean {
+  return repo.repoIcon?.type === 'image' && repo.repoIcon.source === 'github'
+}
+
+function withoutHostProbeCache(repo: Repo, dropIcon: boolean): Partial<Repo> {
+  const { gitRemoteIdentity: _identity, repoIcon, ...configuration } = repo
+  return dropIcon ? configuration : { ...configuration, repoIcon }
+}
+
 export function sameOrcadRepositoryConfiguration(current: Repo, incoming: Repo): boolean {
-  // Git identity is the execution host's cached probe; reimport must keep that host's result.
-  const { gitRemoteIdentity: _currentIdentity, ...currentConfiguration } = current
-  const { gitRemoteIdentity: _incomingIdentity, ...incomingConfiguration } = incoming
+  // Git identity is the execution host's cached probe, and identity enrichment rewrites an
+  // automatic GitHub avatar alongside it; reimport must keep that host's result for both.
+  const dropIcon = isAutomaticGitHubIcon(current) && isAutomaticGitHubIcon(incoming)
   return (
-    serializeOrcadMigrationValue(currentConfiguration) ===
-    serializeOrcadMigrationValue(incomingConfiguration)
+    serializeOrcadMigrationValue(withoutHostProbeCache(current, dropIcon)) ===
+    serializeOrcadMigrationValue(withoutHostProbeCache(incoming, dropIcon))
   )
 }
 
