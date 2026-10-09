@@ -60,7 +60,7 @@ export async function sendTerminalStreamInput(
     text: string
     client: TerminalViewportClient | undefined
     isMobile: boolean
-    /** Waits for the provider's handoff and reports an unverifiable one as `failed`, not `rejected`. */
+    /** Waits for the provider's handoff; one that may have written is `failed`, not `rejected`. */
     requireWriteSettlement?: boolean
   }
 ): Promise<TerminalStreamInputOutcome> {
@@ -101,7 +101,8 @@ export async function sendTerminalStreamInput(
 
 function streamInputOutcome(result: RuntimeTerminalSend): TerminalStreamInputOutcome {
   if (result.writeSettlement?.outcome === 'unverifiable') {
-    return 'failed'
+    // Why: only bytes that may already be in flight are ambiguous; the rest are a proven refusal.
+    return result.writeSettlement.bytesHandedToTransport ? 'failed' : 'rejected'
   }
   return result.accepted ? 'delivered' : 'rejected'
 }

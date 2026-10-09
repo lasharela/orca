@@ -54,6 +54,50 @@ describe('remote runtime recovery input hold', () => {
     await vi.waitFor(() => expect(hold.isHolding()).toBe(false))
   })
 
+  it('pauses a release interrupted by another outage and keeps the rest for the next release', async () => {
+    const hold = createRemoteRuntimeRecoveryInputHold()
+    const { sent, writer } = createWriter()
+    let current = true
+    let resolvePaste = (_accepted: boolean): void => {}
+    const paste = hold.enqueueAccepted(endpoint, 'paste', 'driving')
+    hold.enqueue(endpoint, 'typed after', 'driving')
+    hold.release(endpoint, {
+      ...writer,
+      isCurrent: () => current,
+      sendInputAccepted: vi.fn(
+        () =>
+          new Promise<boolean>((resolve) => {
+            resolvePaste = resolve
+          })
+      )
+    })
+    await vi.waitFor(() => expect(hold.isHolding()).toBe(true))
+    // The link drops while the paste awaits its ack; the ack arrives only after the reattach.
+    current = false
+    resolvePaste(true)
+    await expect(paste).resolves.toBe(true)
+    expect(sent).toEqual([])
+    expect(hold.isHolding()).toBe(true)
+
+    current = true
+    hold.release(endpoint, writer)
+    await vi.waitFor(() => expect(sent).toEqual(['typed after']))
+  })
+
+  it('keeps delivering typing after an accepted write the sequenced stream withdrew or could not confirm', async () => {
+    const hold = createRemoteRuntimeRecoveryInputHold()
+    const { sent, writer } = createWriter()
+    const paste = hold.enqueueAccepted(endpoint, 'paste', 'driving')
+    hold.enqueue(endpoint, 'typed after', 'driving')
+    hold.release(endpoint, {
+      ...writer,
+      sendInputAccepted: vi.fn(async () => false),
+      continuesAfterFailedWrite: () => true
+    })
+    await expect(paste).resolves.toBe(false)
+    await vi.waitFor(() => expect(sent).toEqual(['typed after']))
+  })
+
   it('drops held input when the pane rebinds to a different terminal', async () => {
     const hold = createRemoteRuntimeRecoveryInputHold()
     const { sent, writer } = createWriter()

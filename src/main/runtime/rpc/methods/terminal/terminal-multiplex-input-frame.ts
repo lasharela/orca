@@ -53,13 +53,9 @@ export function handleMultiplexInputFrame(
     void deliver()
     return
   }
-  const inputSeq = frame.seq
-  const { settled } = inputSequenceLedger.admit(stream.ptyId, inputSessionId, inputSeq, deliver)
-  // Why ack a duplicate too: the client replays until acked, and the first copy's ack may have died with its connection.
-  // Why resend instead of WriteUnavailable: the client keeps its journal and resends on this stream; a remount would discard it.
-  void settled.then((admission) =>
-    admission.kind === 'resend'
-      ? state.sendInputAck(stream, admission.fromSeq, 'resend')
-      : state.sendInputAck(stream, inputSeq, admission.kind)
-  )
+  // Why every frame is answered, duplicates too: the client resends until acked, and an earlier
+  // ack may have died with its connection. A refusal asks this live stream to resend, never remounts.
+  void inputSequenceLedger
+    .admit(stream.ptyId, inputSessionId, frame.seq, deliver)
+    .then((admission) => state.sendInputAck(stream, admission.appliedSeq, admission.kind))
 }

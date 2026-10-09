@@ -1,156 +1,232 @@
 import { createBrowserUuid } from '@/lib/browser-uuid'
+import type { TerminalInputAckKind } from '../../../../shared/terminal-stream-protocol'
+import type { RemoteRuntimeMultiplexedTerminal } from '../../runtime/remote-runtime-terminal-multiplexer'
 import {
   isSameRemoteRuntimeInputEndpoint,
   type RemoteRuntimeInputEndpoint
 } from './remote-runtime-recovery-input-hold'
 
-// Why: a retention budget for input in flight across one outage, not a paste ceiling; past it the
-// oldest bytes go and the gap check below stops a partial replay.
+// Why: a retention budget for input in flight across one outage, not a paste ceiling. Past it the
+// oldest bytes go, and nothing after that gap is replayed (it would run without its prefix).
 export const REMOTE_RUNTIME_INPUT_JOURNAL_MAX_CODE_UNITS = 1024 * 1024
 
-// Why bounded: one resend pass fills at most this many slots; the host asks again for the rest.
-export const REMOTE_RUNTIME_INPUT_RESEND_MAX_SEGMENTS = 4096
+// Why backoff: a host refuses input mostly while its PTY is briefly unwritable (an SSH provider
+// reconnecting), and each resend refused again costs a round trip.
+export const REMOTE_RUNTIME_INPUT_RESEND_BACKOFF_MS: readonly number[] = [
+  100, 250, 500, 1000, 2000, 4000, 8000
+]
+// Why: a lost frame or ack must not strand input on a healthy link; resending is safe because the
+// host dedupes by sequence.
+export const REMOTE_RUNTIME_INPUT_ACK_STALL_MS = 5000
 
-export type SequencedRemoteRuntimeInput = {
-  seq: number
-  text: string
-  queryReply: boolean
-  // Its caller gave up on it; a replay must not deliver what was already reported failed.
-  cancelled: boolean
-}
+export type RemoteRuntimeInputStream = Pick<
+  RemoteRuntimeMultiplexedTerminal,
+  'sendInput' | 'inputLedgerId'
+>
 
-/** Input sent to a remote pane but not yet acknowledged by its host, keyed by input sequence. */
+export type RemoteRuntimeInputSegment = { text: string; queryReply: boolean }
+
+/**
+ * Go-back-N sender for one pane's input to a host that acks it. Every unacked input is kept in
+ * order and resent from the host's cumulative ack on a resend request, on a new stream, or when
+ * acks stall. Input that must not run again (a stale query reply, a withdrawn paste, bytes past the
+ * retention budget) is resent as empty text so the host can move past its slot.
+ */
 export type RemoteRuntimeInputJournal = {
   readonly sessionId: string
-  /**
-   * Assigns the next sequence to `text`, which the caller is about to send to `endpoint` on a
-   * stream whose host dedupes with `ledgerId`.
-   */
-  record: (
+  /** Assigns the next sequences to `segments` and sends them, after any input `stream` still owes. */
+  send: (
+    stream: RemoteRuntimeInputStream,
     endpoint: RemoteRuntimeInputEndpoint,
-    ledgerId: string | null,
-    text: string,
-    queryReply?: boolean
-  ) => number
-  /** `applied` is false when the host's write of `seq` failed with unknown delivery. */
-  acknowledge: (seq: number, applied?: boolean) => void
-  /** Resolves true once the host applies `seq`, false if it fails or the journal gives it up first. */
+    segments: readonly RemoteRuntimeInputSegment[]
+  ) => number[]
+  /** Resends unacked input once on a stream it has not used yet (a replacement after an outage). */
+  resume: (stream: RemoteRuntimeInputStream, endpoint: RemoteRuntimeInputEndpoint) => void
+  acknowledge: (appliedSeq: number, kind: TerminalInputAckKind) => void
+  /** True once the host applies `seq`; false if it is withdrawn, dropped, or of unknown delivery. */
   whenAcknowledged: (seq: number) => Promise<boolean>
-  /** Gives up `seq` for its caller: settles it false and keeps it out of any later replay. */
+  /** Withdraws `seq` for its caller; a resend fills its slot with nothing. */
   cancel: (seq: number) => void
-  /**
-   * Input still owed to `bound`, oldest first. Clears itself when it belongs elsewhere, has a gap,
-   * or was sent to a host ledger other than `ledgerId` (that ledger cannot dedupe it).
-   */
-  unacknowledgedFor: (
-    bound: RemoteRuntimeInputEndpoint,
-    ledgerId: string | null
-  ) => readonly SequencedRemoteRuntimeInput[]
-  /**
-   * Every sequence from `fromSeq` the host has not acked, for a host that wrote nothing from there
-   * on. Input that must not run (given up, discarded, or a stale query reply) is sent as empty
-   * text: the host admits sequences only in order, so each slot must still be filled.
-   */
-  resendFrom: (
-    bound: RemoteRuntimeInputEndpoint,
-    ledgerId: string | null,
-    fromSeq: number
-  ) => readonly { seq: number; text: string }[]
   discard: () => void
 }
 
-/** What a replay sends for `entry`: input that must not run still fills its slot, empty. */
-export function replayTextOf(entry: SequencedRemoteRuntimeInput): string {
-  return entry.queryReply || entry.cancelled ? '' : entry.text
-}
+type Entry = { seq: number; text: string }
 
-export function createRemoteRuntimeInputJournal(): RemoteRuntimeInputJournal {
+export function createRemoteRuntimeInputJournal(deps: {
+  /** The stream a timed resend goes to, or null while there is none (the next `resume` resends). */
+  currentStream: () => {
+    stream: RemoteRuntimeInputStream
+    endpoint: RemoteRuntimeInputEndpoint
+  } | null
+}): RemoteRuntimeInputJournal {
   const sessionId = createBrowserUuid()
-  let endpoint: RemoteRuntimeInputEndpoint | null = null
-  let ledger: string | null = null
-  let entries: SequencedRemoteRuntimeInput[] = []
+  let bound: { endpoint: RemoteRuntimeInputEndpoint; ledgerId: string } | null = null
+  let entries: Entry[] = []
   let codeUnits = 0
   let nextSeq = 1
   let ackedSeq = 0
-  // Unlike ackedSeq, never advanced by a discard: the host may still lack the discarded sequences.
-  let hostAckedSeq = 0
-  const waiters = new Map<number, (acknowledged: boolean) => void>()
+  let budgetDroppedThrough = 0
+  let resumedStream: RemoteRuntimeInputStream | null = null
+  let timer: ReturnType<typeof setTimeout> | null = null
+  let resendRequested = false
+  let attempts = 0
+  const waiters = new Map<number, (applied: boolean) => void>()
 
-  const settleWaiters = (throughSeq: number, acknowledged: boolean): void => {
-    for (const [seq, resolve] of waiters) {
-      if (seq <= throughSeq) {
-        waiters.delete(seq)
-        resolve(acknowledged)
+  const settle = (seq: number, applied: boolean): void => {
+    waiters.get(seq)?.(applied)
+    waiters.delete(seq)
+  }
+
+  const dropEntries = (): void => {
+    for (const entry of entries) {
+      settle(entry.seq, false)
+    }
+    entries = []
+    codeUnits = 0
+  }
+
+  const bind = (endpoint: RemoteRuntimeInputEndpoint, ledgerId: string | null): void => {
+    // Why skip null: a stream retired by a failed send reports no ledger, which is not a new one.
+    if (ledgerId === null) {
+      return
+    }
+    if (
+      bound &&
+      (!isSameRemoteRuntimeInputEndpoint(bound.endpoint, endpoint) || bound.ledgerId !== ledgerId)
+    ) {
+      // Why: another shell (#10065) or a restarted host runtime has no record of what was sent,
+      // so it would run it twice; its sequence space starts at the next input.
+      dropEntries()
+      ackedSeq = nextSeq - 1
+    }
+    bound = { endpoint, ledgerId }
+  }
+
+  const clearTimer = (): void => {
+    if (timer !== null) {
+      clearTimeout(timer)
+      timer = null
+    }
+    resendRequested = false
+  }
+
+  const backoff = (): number =>
+    REMOTE_RUNTIME_INPUT_RESEND_BACKOFF_MS[
+      Math.min(attempts, REMOTE_RUNTIME_INPUT_RESEND_BACKOFF_MS.length - 1)
+    ]
+
+  const schedule = (delay: number, resend: boolean): void => {
+    clearTimer()
+    resendRequested = resend
+    timer = setTimeout(() => {
+      timer = null
+      resendRequested = false
+      const target = deps.currentStream()
+      if (target) {
+        attempts += 1
+        resendOn(target.stream, target.endpoint)
+      }
+      armStall()
+    }, delay)
+  }
+
+  const armStall = (): void => {
+    if (ackedSeq >= nextSeq - 1) {
+      clearTimer()
+    } else if (timer === null) {
+      schedule(Math.max(REMOTE_RUNTIME_INPUT_ACK_STALL_MS, backoff()), false)
+    }
+  }
+
+  const resendOn = (
+    stream: RemoteRuntimeInputStream,
+    endpoint: RemoteRuntimeInputEndpoint
+  ): void => {
+    bind(endpoint, stream.inputLedgerId())
+    resumedStream = stream
+    if (budgetDroppedThrough > ackedSeq) {
+      dropEntries()
+      budgetDroppedThrough = nextSeq - 1
+    }
+    let index = 0
+    for (let seq = ackedSeq + 1; seq < nextSeq; seq += 1) {
+      const entry = entries[index]?.seq === seq ? entries[index++] : undefined
+      if (!stream.sendInput(entry?.text ?? '', seq)) {
+        resumedStream = null
+        return
       }
     }
   }
 
-  const discard = (): void => {
-    entries = []
-    codeUnits = 0
-    endpoint = null
-    ledger = null
-    // Why: nothing before this point will be replayed, so later input starts a contiguous run.
-    ackedSeq = nextSeq - 1
-    settleWaiters(Number.POSITIVE_INFINITY, false)
-  }
-
   return {
     sessionId,
-    record(target, ledgerId, text, queryReply = false) {
-      if (
-        (endpoint && !isSameRemoteRuntimeInputEndpoint(endpoint, target)) ||
-        (entries.length > 0 && ledger !== ledgerId)
-      ) {
-        // Why: input typed at one shell must never run in its replacement (#10065).
-        discard()
+    send(stream, endpoint, segments) {
+      // Why one ledger for the whole batch: a failed send retires the stream, which then reports none.
+      const ledgerId = stream.inputLedgerId()
+      if (resumedStream !== stream) {
+        resendOn(stream, endpoint)
       }
-      endpoint = target
-      ledger = ledgerId
-      const seq = nextSeq
-      nextSeq += 1
-      entries.push({ seq, text, queryReply, cancelled: false })
-      codeUnits += text.length
-      while (codeUnits > REMOTE_RUNTIME_INPUT_JOURNAL_MAX_CODE_UNITS && entries.length > 0) {
-        const dropped = entries.shift()
-        codeUnits -= dropped?.text.length ?? 0
-        if (dropped) {
-          settleWaiters(dropped.seq, false)
+      bind(endpoint, ledgerId)
+      let open = resumedStream === stream
+      const seqs = segments.map((segment) => {
+        const seq = nextSeq
+        nextSeq += 1
+        // Why no entry for a query reply: it answers a probe that has timed out by any resend.
+        if (!segment.queryReply) {
+          entries.push({ seq, text: segment.text })
+          codeUnits += segment.text.length
         }
+        // Why keep journaling after a failed send: the next stream resends the rest in order.
+        open = open && stream.sendInput(segment.text, seq)
+        return seq
+      })
+      if (!open) {
+        resumedStream = null
       }
-      return seq
+      let dropped = 0
+      while (
+        codeUnits > REMOTE_RUNTIME_INPUT_JOURNAL_MAX_CODE_UNITS &&
+        dropped < entries.length - 1
+      ) {
+        codeUnits -= entries[dropped].text.length
+        budgetDroppedThrough = entries[dropped].seq
+        settle(budgetDroppedThrough, false)
+        dropped += 1
+      }
+      entries = dropped > 0 ? entries.slice(dropped) : entries
+      armStall()
+      return seqs
     },
-    acknowledge(seq, applied = true) {
-      if (seq >= nextSeq) {
+    resume(stream, endpoint) {
+      if (resumedStream !== stream) {
+        resendOn(stream, endpoint)
+        armStall()
+      }
+    },
+    acknowledge(appliedSeq, kind) {
+      if (appliedSeq >= nextSeq) {
         return
       }
-      hostAckedSeq = Math.max(hostAckedSeq, seq)
-      if (seq <= ackedSeq) {
-        return
+      if (appliedSeq > ackedSeq) {
+        ackedSeq = appliedSeq
+        attempts = 0
+        let settled = 0
+        for (; settled < entries.length && entries[settled].seq <= appliedSeq; settled += 1) {
+          const entry = entries[settled]
+          codeUnits -= entry.text.length
+          settle(entry.seq, !(kind === 'delivery-unknown' && entry.seq === appliedSeq))
+        }
+        entries = entries.slice(settled)
+        clearTimer()
       }
-      ackedSeq = seq
-      let drop = 0
-      while (drop < entries.length && entries[drop].seq <= seq) {
-        codeUnits -= entries[drop].text.length
-        drop += 1
+      if (kind === 'resend' && !resendRequested) {
+        schedule(backoff(), true)
+      } else {
+        armStall()
       }
-      entries = entries.slice(drop)
-      if (!applied) {
-        waiters.get(seq)?.(false)
-        waiters.delete(seq)
-      }
-      settleWaiters(seq, true)
-    },
-    cancel(seq) {
-      const entry = entries.find((candidate) => candidate.seq === seq)
-      if (entry) {
-        entry.cancelled = true
-      }
-      waiters.get(seq)?.(false)
-      waiters.delete(seq)
     },
     whenAcknowledged(seq) {
-      // Why: callers ask right after record(), so a missing entry was already given up.
+      // Why: callers ask right after send(), so a missing entry was already given up.
       if (!entries.some((entry) => entry.seq === seq)) {
         return Promise.resolve(false)
       }
@@ -158,46 +234,18 @@ export function createRemoteRuntimeInputJournal(): RemoteRuntimeInputJournal {
         waiters.set(seq, resolve)
       })
     },
-    unacknowledgedFor(bound, ledgerId) {
-      return owedTo(bound, ledgerId)
-    },
-    resendFrom(bound, ledgerId, fromSeq) {
-      const owed = owedTo(bound, ledgerId)
-      const segments: { seq: number; text: string }[] = []
-      let index = 0
-      for (
-        let seq = Math.max(fromSeq, hostAckedSeq + 1);
-        seq < nextSeq && segments.length < REMOTE_RUNTIME_INPUT_RESEND_MAX_SEGMENTS;
-        seq += 1
-      ) {
-        while (index < owed.length && owed[index].seq < seq) {
-          index += 1
-        }
-        const entry = owed[index]?.seq === seq ? owed[index] : undefined
-        segments.push({ seq, text: entry ? replayTextOf(entry) : '' })
+    cancel(seq) {
+      const index = entries.findIndex((entry) => entry.seq === seq)
+      if (index !== -1) {
+        codeUnits -= entries[index].text.length
+        entries.splice(index, 1)
       }
-      return segments
+      settle(seq, false)
     },
-    discard
-  }
-
-  function owedTo(
-    bound: RemoteRuntimeInputEndpoint,
-    ledgerId: string | null
-  ): readonly SequencedRemoteRuntimeInput[] {
-    if (entries.length === 0) {
-      return entries
+    discard() {
+      dropEntries()
+      clearTimer()
+      resumedStream = null
     }
-    if (
-      !endpoint ||
-      !isSameRemoteRuntimeInputEndpoint(endpoint, bound) ||
-      // Why: a restarted host runtime keeps the PTY but not the ledger, so it would run these again.
-      ledger !== ledgerId ||
-      // Why: replaying around a gap would deliver later keys without the earlier ones.
-      entries[0].seq !== ackedSeq + 1
-    ) {
-      discard()
-    }
-    return entries
   }
 }

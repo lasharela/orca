@@ -4,8 +4,10 @@ import {
   createRemoteRuntimeRecoveryInputHold,
   type RemoteRuntimeInputEndpoint
 } from './remote-runtime-recovery-input-hold'
-import { createRemoteRuntimeInputJournal, replayTextOf } from './remote-runtime-input-journal'
-import { createRemoteRuntimeInputResendScheduler } from './remote-runtime-input-resend-scheduler'
+import {
+  createRemoteRuntimeInputJournal,
+  type RemoteRuntimeInputSegment
+} from './remote-runtime-input-journal'
 import type { AcceptedInputOptions } from './pty-preconnect-input-buffer'
 import type { TerminalInputKind } from '../../../../shared/terminal-input-kind'
 /* eslint-disable max-lines -- Why: remote PTY transport keeps lifecycle, JSON fallback, and binary stream wiring together so reconnect/destroy ordering stays testable as one behavior surface. */
@@ -145,6 +147,13 @@ type RemoteAgentSessionLaunchResult =
   | RuntimeEnsureAgentSessionResult
   | RuntimeCreateAgentSessionResult
   | { terminal: RuntimeTerminalCreate; disposition?: undefined }
+
+function inputSegments(text: string): RemoteRuntimeInputSegment[] {
+  return Array.from(iterateTerminalInputChunks(text), (chunk) => ({
+    text: chunk,
+    queryReply: false
+  }))
+}
 
 function isRemoteTerminalStaleMessage(message: string): boolean {
   return message.includes('terminal_handle_stale')
@@ -302,14 +311,7 @@ export function createRemoteRuntimePtyTransport(
   }
 
   const recoveryInputHold = createRemoteRuntimeRecoveryInputHold()
-  const inputJournal = createRemoteRuntimeInputJournal()
-  // Why: replay owed input exactly once per stream, before anything new is sequenced on it.
-  let inputJournalReplayedStream: RemoteRuntimeMultiplexedTerminal | null = null
-  const inputResend = createRemoteRuntimeInputResendScheduler({
-    resend: (fromSeq) => resendInputFrom(fromSeq),
-    // Why remount only now: refusals this long mean the host lost the terminal, not a brief blip.
-    giveUp: () => notifyWriteUnavailable()
-  })
+  const inputJournal = createRemoteRuntimeInputJournal({ currentStream: sequencedInputTarget })
   const recovery = new RemoteRuntimePtyRecoveryState(() => {
     if (recovery.currentPhase === 'disposed') {
       clearPublishedHandleWait()
@@ -457,8 +459,7 @@ export function createRemoteRuntimePtyTransport(
     pendingClaimQueryReplyCount = 0
     const boundHandle = multiplexedStreamHandle
     if (stream.acknowledgesInput() && boundHandle) {
-      replayUnacknowledgedInput(stream, boundHandle)
-      sendSequencedInput(stream, boundHandle, queued)
+      inputJournal.send(stream, heldInputEndpoint(boundHandle), queued)
     } else {
       for (const segment of queued) {
         stream.sendInput(segment.text)
@@ -1486,7 +1487,6 @@ export function createRemoteRuntimePtyTransport(
   function discardPendingInput(): void {
     recoveryInputHold.discard()
     inputJournal.discard()
-    inputResend.cancel()
   }
 
   // Why: these bytes never reached a stream, so holding them for the reattach cannot duplicate them.
@@ -1535,46 +1535,25 @@ export function createRemoteRuntimePtyTransport(
   }
 
   // Why: a host that acks input dedupes by sequence, so resending what it may already have is safe.
-  function replayUnacknowledgedInput(
+  function resumeSequencedInput(
     stream: RemoteRuntimeMultiplexedTerminal,
     boundHandle: string
   ): void {
-    if (inputJournalReplayedStream === stream) {
-      return
-    }
-    inputJournalReplayedStream = stream
-    inputResend.cancel()
-    if (!stream.acknowledgesInput()) {
+    if (stream.acknowledgesInput()) {
+      inputJournal.resume(stream, heldInputEndpoint(boundHandle))
+    } else {
       // Why: without acks, delivery of earlier bytes is unknown; replaying could run them twice.
       inputJournal.discard()
-      return
-    }
-    for (const entry of inputJournal.unacknowledgedFor(
-      heldInputEndpoint(boundHandle),
-      stream.inputLedgerId()
-    )) {
-      // Why empty, not skipped: the host writes only in sequence order, so each slot is filled.
-      stream.sendInput(replayTextOf(entry), entry.seq)
     }
   }
 
-  // Why the same stream: the host refused or saw a gap, and a remount would discard the journal.
-  function resendInputFrom(fromSeq: number): void {
+  function sequencedInputTarget() {
     const boundHandle = handle
     if (destroyed || terminalEnded || !connected || !boundHandle || recoveryBlocksIo()) {
-      return
+      return null
     }
     const stream = getCurrentMultiplexedStream(boundHandle)
-    if (!stream?.acknowledgesInput()) {
-      return
-    }
-    for (const segment of inputJournal.resendFrom(
-      heldInputEndpoint(boundHandle),
-      stream.inputLedgerId(),
-      fromSeq
-    )) {
-      stream.sendInput(segment.text, segment.seq)
-    }
+    return stream?.acknowledgesInput() ? { stream, endpoint: heldInputEndpoint(boundHandle) } : null
   }
 
   function heldInputEndpoint(targetHandle: string) {
@@ -1607,12 +1586,14 @@ export function createRemoteRuntimePtyTransport(
       return
     }
     // Why first: journaled bytes were typed before anything in the hold.
-    replayUnacknowledgedInput(stream, boundHandle)
+    resumeSequencedInput(stream, boundHandle)
     recoveryInputHold.release(heldInputEndpoint(boundHandle), {
       isCurrent: () => connected && handle === boundHandle && !recoveryBlocksIo(),
       sendInput: (data) => sendInputNow(data),
       sendInputImmediate: (data) => sendInputImmediateNow(data),
-      sendInputAccepted: sendInputAcceptedToRuntime
+      sendInputAccepted: sendInputAcceptedToRuntime,
+      continuesAfterFailedWrite: () =>
+        getCurrentMultiplexedStream(boundHandle)?.acknowledgesInput() === true
     })
   }
 
@@ -1693,44 +1674,15 @@ export function createRemoteRuntimePtyTransport(
     text: string,
     signal: AbortSignal | undefined
   ): Promise<boolean> {
-    replayUnacknowledgedInput(stream, targetHandle)
+    const endpoint = heldInputEndpoint(targetHandle)
     // Why its own sequences: aborting the caller's bytes must not cancel typing batched ahead of them.
-    sendSequencedInput(
-      stream,
-      targetHandle,
-      Array.from(iterateTerminalInputChunks(pendingTyping), (chunk) => ({
-        text: chunk,
-        queryReply: false
-      }))
-    )
-    const seqs = sendSequencedInput(
-      stream,
-      targetHandle,
-      Array.from(iterateTerminalInputChunks(text), (chunk) => ({ text: chunk, queryReply: false }))
-    )
+    inputJournal.send(stream, endpoint, inputSegments(pendingTyping))
+    const seqs = inputJournal.send(stream, endpoint, inputSegments(text))
     const acknowledged = seqs.map((seq) => inputJournal.whenAcknowledged(seq))
     signal?.addEventListener('abort', () => seqs.forEach((seq) => inputJournal.cancel(seq)), {
       once: true
     })
     return Promise.all(acknowledged).then((results) => results.every(Boolean))
-  }
-
-  // Why one endpoint and ledger for the whole batch: a failed send retires the stream, which then
-  // reports no ledger, and recording against that would discard every earlier unacked byte.
-  function sendSequencedInput(
-    stream: RemoteRuntimeMultiplexedTerminal,
-    targetHandle: string,
-    segments: readonly { text: string; queryReply: boolean }[]
-  ): number[] {
-    const endpoint = heldInputEndpoint(targetHandle)
-    const ledgerId = stream.inputLedgerId()
-    let streamOpen = true
-    return segments.map((segment) => {
-      const seq = inputJournal.record(endpoint, ledgerId, segment.text, segment.queryReply)
-      // Why keep journaling after a failed send: the reattach replays the unsent rest in order.
-      streamOpen = streamOpen && stream.sendInput(segment.text, seq)
-      return seq
-    })
   }
 
   function notifyWriteUnavailable(): void {
@@ -1747,9 +1699,8 @@ export function createRemoteRuntimePtyTransport(
     }
     const stream = getCurrentMultiplexedStream(targetHandle)
     if (stream?.acknowledgesInput()) {
-      replayUnacknowledgedInput(stream, targetHandle)
       // Why true even if unsent: a failed write closes this stream, and the reattach replays the journal.
-      sendSequencedInput(stream, targetHandle, [{ text, queryReply }])
+      inputJournal.send(stream, heldInputEndpoint(targetHandle), [{ text, queryReply }])
       return true
     }
     if (stream?.sendInput(text)) {
@@ -2431,15 +2382,9 @@ export function createRemoteRuntimePtyTransport(
             notifyWriteUnavailable()
           }
         },
-        onInputAcknowledged: (inputSeq, applied) => {
-          if (handle === subscribedHandle) {
-            inputJournal.acknowledge(inputSeq, applied)
-            inputResend.noteProgress()
-          }
-        },
-        onInputResendRequested: (fromSeq) => {
+        onInputAck: (appliedSeq, kind) => {
           if (isCurrentSubscription()) {
-            inputResend.request(fromSeq)
+            inputJournal.acknowledge(appliedSeq, kind)
           }
         },
         onTransportClose: ({ recoverable, retryWithBackoff }) => {

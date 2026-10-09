@@ -13,7 +13,7 @@ import { REMOTE_RUNTIME_AUTO_RECOVERY_TIMEOUT_MS } from './remote-runtime-pty-re
 import { runTerminalPasteOperationWithTimeout } from './terminal-paste-operation-timeout'
 import { writeTerminalPastePtyInput } from './terminal-pty-paste-writer'
 import { TERMINAL_REMOTE_PASTE_OPERATION_TIMEOUT_MS } from './terminal-paste-limits'
-import { REMOTE_RUNTIME_INPUT_RESEND_DELAYS_MS } from './remote-runtime-input-resend-scheduler'
+import { REMOTE_RUNTIME_INPUT_RESEND_BACKOFF_MS } from './remote-runtime-input-journal'
 
 let subscriptionCallbacks: MultiplexSubscriptionCallbacks = null
 let resolvedPaneHandle = 'terminal-1'
@@ -417,8 +417,8 @@ describe('remote pane input across a silent outage', () => {
     await vi.waitFor(() => expect(sentInputs()).toHaveLength(3))
 
     // The host's PTY briefly refused seq 2 and wrote nothing after it.
-    emitInputAck(streamId, 2, RESEND_REQUEST)
-    emitInputAck(streamId, 2, RESEND_REQUEST)
+    emitInputAck(streamId, 1, RESEND_REQUEST)
+    emitInputAck(streamId, 1, RESEND_REQUEST)
     await vi.waitFor(() => expect(sentInputs()).toHaveLength(5))
     expect(sentInputs().slice(3)).toEqual([
       { seq: 2, text: 'b' },
@@ -432,23 +432,22 @@ describe('remote pane input across a silent outage', () => {
     transport.destroy?.()
   })
 
-  it('remounts only once the host has refused every resend', async () => {
+  it('never remounts the pane over refusals, and keeps resending with capped backoff', async () => {
     vi.useFakeTimers()
     try {
       const onWriteUnavailable = vi.fn()
       const { transport, streamId } = await connectPane({ inputAck: 1 }, { onWriteUnavailable })
       transport.sendInput('a', 'driving')
       await vi.advanceTimersByTimeAsync(20)
-      for (const delay of REMOTE_RUNTIME_INPUT_RESEND_DELAYS_MS) {
-        emitInputAck(streamId, 1, RESEND_REQUEST)
-        await vi.advanceTimersByTimeAsync(delay)
+      const refusals = REMOTE_RUNTIME_INPUT_RESEND_BACKOFF_MS.length + 3
+      for (let attempt = 0; attempt < refusals; attempt += 1) {
+        emitInputAck(streamId, 0, RESEND_REQUEST)
+        await vi.advanceTimersByTimeAsync(REMOTE_RUNTIME_INPUT_RESEND_BACKOFF_MS.at(-1) ?? 0)
       }
+      expect(sentInputs().filter((input) => input.text === 'a').length).toBeGreaterThan(refusals)
       expect(onWriteUnavailable).not.toHaveBeenCalled()
-      expect(sentInputs().filter((input) => input.text === 'a')).toHaveLength(
-        REMOTE_RUNTIME_INPUT_RESEND_DELAYS_MS.length + 1
-      )
-      emitInputAck(streamId, 1, RESEND_REQUEST)
-      expect(onWriteUnavailable).toHaveBeenCalledTimes(1)
+      expect(subscribeFrameCount()).toBe(1)
+      emitInputAck(streamId, 1)
       transport.destroy?.()
     } finally {
       vi.useRealTimers()

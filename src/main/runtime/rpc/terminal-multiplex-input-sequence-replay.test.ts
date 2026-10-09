@@ -11,14 +11,14 @@ import {
   encodeTerminalStreamFrame,
   encodeTerminalStreamJson,
   encodeTerminalStreamText,
-  isTerminalInputAckDeliveryUnknown,
-  isTerminalInputAckResend
+  decodeTerminalInputAck,
+  type TerminalInputAckKind
 } from '../../../shared/terminal-stream-protocol'
 import { makeRequest, stubRuntime } from './terminal-multiplex-test-harness'
 
 type FrameHandler = (frame: NonNullable<ReturnType<typeof decodeTerminalStreamFrame>>) => void
 
-type ScriptedWrite = 'accept' | 'reject' | 'throw' | 'unverifiable'
+type ScriptedWrite = 'accept' | 'reject' | 'throw' | 'unverifiable' | 'unhanded'
 
 function createRuntime(
   writes: string[],
@@ -60,6 +60,19 @@ function createRuntime(
             outcome: 'unverifiable' as const,
             reason: 'transport_settlement_lost' as const,
             bytesHandedToTransport: true
+          }
+        }
+      }
+      if (scripted === 'unhanded') {
+        // Settlement lost, but the provider proves no byte left before it was disposed.
+        return {
+          handle: 'terminal-1',
+          accepted: false,
+          bytesWritten: 0,
+          writeSettlement: {
+            outcome: 'unverifiable' as const,
+            reason: 'transport_settlement_lost' as const,
+            bytesHandedToTransport: false
           }
         }
       }
@@ -117,7 +130,10 @@ async function openConnection(
   await vi.waitFor(() =>
     expect(messages.some((message) => JSON.parse(message).result?.type === 'subscribed')).toBe(true)
   )
-  const subscribed: { capabilities?: Record<string, unknown>; inputLedgerId?: string } = JSON.parse(
+  const subscribed: {
+    capabilities?: Record<string, unknown>
+    inputLedgerId?: string
+  } = JSON.parse(
     messages.find((message) => JSON.parse(message).result?.type === 'subscribed')!
   ).result
   return {
@@ -133,33 +149,14 @@ async function openConnection(
           })
         )!
       ),
-    inputAcks: () =>
-      binaryFrames
-        .map((bytes) => decodeTerminalStreamFrame(bytes))
-        .filter(
-          (frame) =>
-            frame?.opcode === TerminalStreamOpcode.InputAck &&
-            !isTerminalInputAckResend(frame.payload)
-        )
-        .map((frame) => frame!.seq),
-    resendRequests: () =>
-      binaryFrames
-        .map((bytes) => decodeTerminalStreamFrame(bytes))
-        .filter(
-          (frame) =>
-            frame?.opcode === TerminalStreamOpcode.InputAck &&
-            isTerminalInputAckResend(frame.payload)
-        )
-        .map((frame) => frame!.seq),
-    deliveryUnknownAcks: () =>
-      binaryFrames
-        .map((bytes) => decodeTerminalStreamFrame(bytes))
-        .filter(
-          (frame) =>
-            frame?.opcode === TerminalStreamOpcode.InputAck &&
-            isTerminalInputAckDeliveryUnknown(frame.payload)
-        )
-        .map((frame) => frame!.seq),
+    inputAcks: (kind: TerminalInputAckKind = 'applied') =>
+      binaryFrames.flatMap((bytes) => {
+        const frame = decodeTerminalStreamFrame(bytes)
+        return frame?.opcode === TerminalStreamOpcode.InputAck &&
+          decodeTerminalInputAck(frame.payload) === kind
+          ? [frame.seq]
+          : []
+      }),
     writeUnavailableCount: () =>
       binaryFrames.filter(
         (bytes) =>
@@ -211,7 +208,7 @@ describe('terminal multiplex sequenced input across reconnects', () => {
     stream.sendInput(1, 'echo a\r')
     stream.sendInput(2, 'echo b\r')
     stream.sendInput(3, 'echo c\r')
-    await vi.waitFor(() => expect(stream.resendRequests()).toEqual([2, 2]))
+    await vi.waitFor(() => expect(stream.inputAcks('resend')).toEqual([1, 1]))
     // Neither the refused seq 2 nor seq 3 behind it may be acked, or the client drops them.
     expect(stream.inputAcks()).toEqual([1])
     expect(writes).toEqual(['echo a\r'])
@@ -236,11 +233,28 @@ describe('terminal multiplex sequenced input across reconnects', () => {
     const subscribe = { capabilities: { inputAck: 1 as const }, inputSessionId: 'pane-a' }
     const connection = await openConnection(dispatcher, 'conn-1', subscribe)
     connection.sendInput(1, 'make deploy\r')
-    await vi.waitFor(() => expect(connection.inputAcks()).toEqual([1]))
+    await vi.waitFor(() => expect(connection.inputAcks('delivery-unknown')).toEqual([1]))
     expect(sendOptions[0]).toMatchObject({ requireWriteSettlement: true })
     // Unknown, not refused: a resend could run the command twice.
-    expect(connection.deliveryUnknownAcks()).toEqual([1])
-    expect(connection.resendRequests()).toEqual([])
+    expect(connection.inputAcks('resend')).toEqual([])
+  })
+
+  it('asks for a resend when an unsettled handoff proves no byte left', async () => {
+    const writes: string[] = []
+    const dispatcher = new RpcDispatcher({
+      runtime: createRuntime(writes, async () => {}, ['unhanded']),
+      methods: TERMINAL_METHODS
+    })
+    const subscribe = {
+      capabilities: { inputAck: 1 as const },
+      inputSessionId: 'pane-a'
+    }
+    const connection = await openConnection(dispatcher, 'conn-1', subscribe)
+    connection.sendInput(1, 'make deploy\r')
+    await vi.waitFor(() => expect(connection.inputAcks('resend')).toEqual([0]))
+    connection.sendInput(1, 'make deploy\r')
+    await vi.waitFor(() => expect(connection.inputAcks()).toEqual([1]))
+    expect(writes).toEqual(['make deploy\r'])
   })
 
   it('tells the client a thrown write has unknown delivery instead of acking it as applied', async () => {
@@ -253,8 +267,8 @@ describe('terminal multiplex sequenced input across reconnects', () => {
     const connection = await openConnection(dispatcher, 'conn-1', subscribe)
     connection.sendInput(1, 'make deploy\r')
     connection.sendInput(2, 'ls\r')
-    await vi.waitFor(() => expect(connection.inputAcks()).toEqual([1, 2]))
-    expect(connection.deliveryUnknownAcks()).toEqual([1])
+    await vi.waitFor(() => expect(connection.inputAcks()).toEqual([2]))
+    expect(connection.inputAcks('delivery-unknown')).toEqual([1])
     expect(writes).toEqual(['ls\r'])
   })
 

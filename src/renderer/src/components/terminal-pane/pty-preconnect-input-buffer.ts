@@ -33,6 +33,11 @@ type PreconnectInputWriter = {
     inputKind: TerminalInputKind,
     options?: AcceptedInputOptions
   ) => Promise<boolean>
+  /**
+   * True when a failed accepted write was withdrawn or of unknown delivery, not a broken link, so
+   * the input typed after it still goes (a sequenced remote stream keeps order on its own).
+   */
+  continuesAfterFailedWrite?: () => boolean
 }
 
 export type PtyPreconnectInputBuffer = {
@@ -55,8 +60,12 @@ export type PtyPreconnectInputBuffer = {
 }
 
 export type PtyPreconnectInputBufferOptions = {
-  // Why: an outage can hold minutes of per-keystroke input; merging keeps the entry cap from dropping keys.
-  coalesceOrdinary?: boolean
+  /**
+   * Holds input across a remote outage: consecutive keystrokes merge (minutes of typing must not
+   * hit the entry cap), and a release interrupted by another outage pauses with the rest kept
+   * for the next release instead of dropping it.
+   */
+  recoveryHold?: boolean
 }
 
 export function createPtyPreconnectInputBuffer(
@@ -78,7 +87,7 @@ export function createPtyPreconnectInputBuffer(
     const activeCodeUnits = activeAcceptedInput?.data.length ?? 0
     const tail = pending.at(-1)
     if (
-      options.coalesceOrdinary &&
+      options.recoveryHold &&
       buffering &&
       input.kind === 'ordinary' &&
       tail?.kind === 'ordinary' &&
@@ -164,6 +173,12 @@ export function createPtyPreconnectInputBuffer(
         if (input.kind === 'accepted') {
           activeAcceptedInput = input
         }
+        if (buffering && options.recoveryHold && !writer.isCurrent()) {
+          pending.unshift(input)
+          pendingCodeUnits += input.data.length
+          activeAcceptedInput = null
+          return
+        }
         if (!buffering || !writer.isCurrent()) {
           input.resolve?.(false)
           clear()
@@ -199,7 +214,7 @@ export function createPtyPreconnectInputBuffer(
           }
           input.resolve?.(accepted)
           // Why not for a withdrawn write: its caller gave up on it alone, not on what was typed after it.
-          if (!accepted && !input.signal?.aborted) {
+          if (!accepted && !input.signal?.aborted && !writer.continuesAfterFailedWrite?.()) {
             clear()
             return
           }

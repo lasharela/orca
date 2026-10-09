@@ -20,6 +20,7 @@ type HeldInputWriter = {
     inputKind: TerminalInputKind,
     options?: AcceptedInputOptions
   ) => Promise<boolean>
+  continuesAfterFailedWrite?: () => boolean
 }
 
 export type RemoteRuntimeRecoveryInputHold = {
@@ -73,7 +74,7 @@ export function createRemoteRuntimeRecoveryInputHold(): RemoteRuntimeRecoveryInp
     }
     if (!held?.buffer.isBuffering()) {
       // Why: a drained buffer refuses input; its release bookkeeping may still be settling.
-      held = { endpoint, buffer: createPtyPreconnectInputBuffer([], { coalesceOrdinary: true }) }
+      held = { endpoint, buffer: createPtyPreconnectInputBuffer([], { recoveryHold: true }) }
     }
     return held.buffer
   }

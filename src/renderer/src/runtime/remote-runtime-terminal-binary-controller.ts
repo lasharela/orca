@@ -3,8 +3,7 @@ import {
   decodeTerminalStreamFrame,
   decodeTerminalStreamJson,
   decodeTerminalStreamText,
-  isTerminalInputAckDeliveryUnknown,
-  isTerminalInputAckResend,
+  decodeTerminalInputAck,
   type TerminalStreamFrame
 } from '../../../shared/terminal-stream-protocol'
 import { deliverTerminalDataWithDeferredCredit } from '@/lib/pane-manager/terminal-delivery-credit'
@@ -52,14 +51,7 @@ export abstract class RemoteRuntimeTerminalBinaryController extends RemoteRuntim
       if (!stream.supportsInputAck) {
         return
       }
-      if (isTerminalInputAckResend(frame.payload)) {
-        stream.callbacks.onInputResendRequested?.(frame.seq)
-      } else {
-        stream.callbacks.onInputAcknowledged?.(
-          frame.seq,
-          !isTerminalInputAckDeliveryUnknown(frame.payload)
-        )
-      }
+      stream.callbacks.onInputAck?.(frame.seq, decodeTerminalInputAck(frame.payload))
       return
     }
     if (isOutput) {

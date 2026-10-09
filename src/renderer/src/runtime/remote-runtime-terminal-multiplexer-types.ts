@@ -1,5 +1,6 @@
 import type { TerminalSnapshotUnavailableReason } from '../../../shared/terminal-snapshot-unavailability'
 import type { TerminalStreamEndVerdict } from '../../../shared/terminal-stream-end-verdict'
+import type { TerminalInputAckKind } from '../../../shared/terminal-stream-protocol'
 import type { RemoteTerminalStreamWatchdog } from './remote-terminal-stream-watchdog'
 
 export type RuntimeEnvironmentSubscriptionHandle = {
@@ -63,13 +64,8 @@ export type RemoteRuntimeMultiplexedTerminalCallbacks = {
     driver: { kind: 'idle' } | { kind: 'desktop' } | { kind: 'mobile'; clientId: string }
   ) => void
   onWriteUnavailable?: () => void
-  /**
-   * The host settled sequenced input through `inputSeq` (negotiated streams only); `applied` is
-   * false when that write failed with unknown delivery, so it must be neither replayed nor reported sent.
-   */
-  onInputAcknowledged?: (inputSeq: number, applied: boolean) => void
-  /** The host wrote nothing from `fromSeq` on (a refusal or a gap) and needs that input sent again, in order. */
-  onInputResendRequested?: (fromSeq: number) => void
+  /** Cumulative host ack of sequenced input through `appliedSeq` (negotiated streams only). */
+  onInputAck?: (appliedSeq: number, kind: TerminalInputAckKind) => void
   onTransportClose?: (event: { recoverable: boolean; retryWithBackoff?: boolean }) => void
 }
 

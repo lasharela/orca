@@ -33,30 +33,31 @@ export enum TerminalStreamOpcode {
   SetOutputPaused = 16,
   // Negotiated per stream because older clients reject unknown opcodes.
   WriteUnavailable = 17,
-  // Host->client; `seq` is the client input sequence the host settled (see the payload helpers below). Sent only after `inputAck` negotiation.
+  // Host->client; `seq` is the cumulative input sequence the host applied (see encodeTerminalInputAck). Sent only after `inputAck` negotiation.
   InputAck = 18
 }
 
-const INPUT_ACK_DELIVERY_UNKNOWN = 1
-const INPUT_ACK_RESEND = 2
+export type TerminalInputAckKind = 'applied' | 'delivery-unknown' | 'resend'
 
-/** InputAck payload for a write that failed after it may have written; the client must not replay it. */
-export function encodeTerminalInputAckDeliveryUnknown(): Uint8Array {
-  return Uint8Array.of(INPUT_ACK_DELIVERY_UNKNOWN)
+const INPUT_ACK_FLAGS: Record<TerminalInputAckKind, number> = {
+  applied: 0,
+  // The write at `seq` may have reached the terminal; the client must not resend it.
+  'delivery-unknown': 1,
+  // A refusal or gap: the host needs everything after `seq` sent again, in order.
+  resend: 2
 }
 
-/** InputAck payload that acks nothing: `seq` is the oldest input the host needs sent again. */
-export function encodeTerminalInputAckResend(): Uint8Array {
-  return Uint8Array.of(INPUT_ACK_RESEND)
+/** InputAck payload; `seq` is the host's cumulative applied input sequence. */
+export function encodeTerminalInputAck(kind: TerminalInputAckKind): Uint8Array {
+  return kind === 'applied' ? new Uint8Array() : Uint8Array.of(INPUT_ACK_FLAGS[kind])
 }
 
-/** An empty InputAck payload means the host applied the input. */
-export function isTerminalInputAckDeliveryUnknown(payload: Uint8Array): boolean {
-  return payload[0] === INPUT_ACK_DELIVERY_UNKNOWN
-}
-
-export function isTerminalInputAckResend(payload: Uint8Array): boolean {
-  return payload[0] === INPUT_ACK_RESEND
+export function decodeTerminalInputAck(payload: Uint8Array): TerminalInputAckKind {
+  return payload[0] === INPUT_ACK_FLAGS.resend
+    ? 'resend'
+    : payload[0] === INPUT_ACK_FLAGS['delivery-unknown']
+      ? 'delivery-unknown'
+      : 'applied'
 }
 
 export type TerminalStreamFrame = {
